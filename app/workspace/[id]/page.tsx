@@ -4,6 +4,8 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useSearchParams, useRouter } from 'next/navigation'
 import { createBrowserClient } from '@supabase/ssr'
 import { useWorkspaceStore } from '@/store/workspace'
+import { ArtifactPanel } from '@/components/artifacts/ArtifactPanel'
+import type { Artifact } from '@/types'
 
 function supabase() {
   return createBrowserClient(
@@ -66,7 +68,7 @@ export default function WorkspaceDashboard() {
   const [processingMeeting, setProcessingMeeting] = useState(false)
   const [activePipeline, setActivePipeline] = useState<any[]>([])
   const [taskPipelines, setTaskPipelines] = useState<Record<string, any[]>>({})
-  const [finalOutput, setFinalOutput] = useState('')
+  const [finalOutput, setFinalOutput] = useState<string | Artifact>('')
   const [liveUpdates, setLiveUpdates] = useState<any[]>([])
   const [humanMsg, setHumanMsg] = useState('')
   const [meetingInputText, setMeetingInputText] = useState('')
@@ -136,21 +138,18 @@ export default function WorkspaceDashboard() {
     store.setActiveTaskId(taskId)
     setFinalOutput(''); setLiveUpdates([])
 
+    // Load pipeline + artifact for THIS task only (lazy — no bulk loadArtifacts)
     const sb = supabase()
-    const [pipelineRes] = await Promise.all([
+    const [pipelineRes, artifactRes] = await Promise.all([
       sb.from('task_pipeline').select('*').eq('task_id', taskId).order('step_index'),
-      store.loadArtifacts(workspaceId)
+      sb.from('artifacts').select('*')
+        .eq('task_id', taskId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
     ])
     setActivePipeline(pipelineRes.data || [])
-
-    const artifact = store.artifacts.find(a => a.task_id === taskId)
-    if (artifact) { setFinalOutput(artifact.content); return }
-
-    const { data: directArtifact } = await sb
-      .from('artifacts').select('content')
-      .eq('task_id', taskId).order('created_at', { ascending: false })
-      .limit(1).maybeSingle()
-    if (directArtifact?.content) setFinalOutput(directArtifact.content)
+    if (artifactRes.data) setFinalOutput(artifactRes.data as Artifact)
   }
 
   async function handleApprove(taskId: string) {
@@ -250,9 +249,11 @@ export default function WorkspaceDashboard() {
             setLiveUpdates(prev => [...prev, update])
             if (update.update_type === 'progress') {
               setTimeout(async () => {
-                await store.loadArtifacts(workspaceId)
-                const artifact = store.artifacts.find(a => a.task_id === store.activeTaskId)
-                if (artifact) setFinalOutput(artifact.content)
+                const { data } = await supabase()
+                  .from('artifacts').select('*')
+                  .eq('task_id', store.activeTaskId!).order('created_at', { ascending: false })
+                  .limit(1).maybeSingle()
+                if (data) setFinalOutput(data as Artifact)
               }, 800)
             }
           }
@@ -272,14 +273,11 @@ export default function WorkspaceDashboard() {
       const tryLoad = async () => {
         for (let attempt = 0; attempt < 4; attempt++) {
           await new Promise(r => setTimeout(r, attempt * 600))
-          await store.loadArtifacts(workspaceId)
-          const artifact = store.artifacts.find(a => a.task_id === store.activeTaskId)
-          if (artifact?.content) { setFinalOutput(artifact.content); break }
           const { data } = await supabase()
-            .from('artifacts').select('content')
+            .from('artifacts').select('*')
             .eq('task_id', store.activeTaskId!).order('created_at', { ascending: false })
             .limit(1).maybeSingle()
-          if (data?.content) { setFinalOutput(data.content); break }
+          if (data) { setFinalOutput(data as Artifact); break }
         }
       }
       tryLoad()
@@ -490,7 +488,21 @@ export default function WorkspaceDashboard() {
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M9 12l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg>
                       Output
                     </div>
-                    <div className="output-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(finalOutput) }} />
+                    {typeof finalOutput === 'object' && (finalOutput as Artifact).type === 'datagrid' ? (
+                      <ArtifactPanel
+                        artifact={finalOutput as Artifact}
+                        workspaceId={workspaceId}
+                        onUpdate={(updated) => setFinalOutput(updated)}
+                      />
+                    ) : (
+                      <div className="output-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(
+                        typeof finalOutput === 'object'
+                          ? ((finalOutput as Artifact).content as any)?.markdown
+                            || ((finalOutput as Artifact).content as any)?.body
+                            || JSON.stringify((finalOutput as Artifact).content, null, 2)
+                          : finalOutput
+                      ) }} />
+                    )}
                     <details className="thinking-details">
                       <summary>Agent thinking</summary>
                       <div className="thinking-stream">

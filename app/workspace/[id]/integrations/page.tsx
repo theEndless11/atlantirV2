@@ -1,4 +1,5 @@
 'use client'
+// @ts-ignore — installed via: npm install @nangohq/frontend
 import Nango from '@nangohq/frontend'
 
 import { useState, useEffect, useCallback } from 'react'
@@ -21,7 +22,7 @@ import {
 } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
 
-// Integration metadata 
+// ─── Integration metadata ─────────────────────────────────────────────────────
 
 type IntegrationCategory = 'Messaging' | 'Dev' | 'CRM' | 'PM' | 'Finance' | 'Infra'
 type AuthType = 'oauth' | 'apikey'
@@ -62,10 +63,20 @@ const INTEGRATIONS: Record<string, IntegrationMeta> = {
   asana:           { name: 'Asana',           description: 'Create and assign tasks in Asana projects.',      category: 'PM',       color: '#fc636b', authType: 'oauth', nangoApp: 'asana' },
   trello:          { name: 'Trello',          description: 'Create cards in Trello boards.',                  category: 'PM',       color: '#0052cc', authType: 'oauth', nangoApp: 'trello' },
   excel:           { name: 'Microsoft Excel', description: 'Create and manage Excel spreadsheets.',           category: 'Finance',  color: '#217346', authType: 'oauth', nangoApp: 'microsoft-excel' },
-  vercel:          { name: 'Vercel',          description: 'Monitor deployments and project status.',         category: 'Infra',    color: '#000000', authType: 'oauth', nangoApp: 'vercel' },
-  pagerduty:       { name: 'PagerDuty',       description: 'Trigger and manage incidents.',                   category: 'Infra',    color: '#06ac38', authType: 'oauth', nangoApp: 'pagerduty' },
 
-  // ── API Key ────────────────────────────────────────────────────────────────
+
+  vercel: {
+    name: 'Vercel', description: 'Monitor deployments and project status.', category: 'Infra', color: '#000000', authType: 'apikey',
+    fields: [
+      { key: 'api_token', label: 'API Token', placeholder: 'your_vercel_token', secret: true, hint: 'Create at vercel.com/account/tokens' },
+    ],
+  },
+  pagerduty: {
+    name: 'PagerDuty', description: 'Trigger and manage incidents.', category: 'Infra', color: '#06ac38', authType: 'apikey',
+    fields: [
+      { key: 'routing_key', label: 'Integration Key', placeholder: 'your_routing_key', secret: true, hint: 'Create at app.pagerduty.com/developer/apps' },
+    ],
+  },
   twilio: {
     name: 'Twilio', description: 'Send SMS messages to any phone number.', category: 'Messaging', color: '#f22f46', authType: 'apikey',
     fields: [
@@ -291,8 +302,9 @@ export default function IntegrationsPage() {
   const [employees, setEmployees] = useState<Employee[]>([])
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string>('')
 
-  // OAuth statuses (per-employee via Nango)
+  // OAuth statuses: live Nango check (may be loading/stale) + persisted Supabase copy (instant on refresh)
   const [oauthStatuses, setOauthStatuses] = useState<Record<string, ConnectionStatus>>({})
+  const [persistedOauthStatuses, setPersistedOauthStatuses] = useState<Record<string, Record<string, ConnectionStatus>>>({})
 
   // API key statuses + saved configs (per-workspace via Supabase integrations table)
   const [apikeyStatuses, setApikeyStatuses] = useState<Record<string, ConnectionStatus>>({})
@@ -315,35 +327,47 @@ export default function IntegrationsPage() {
       .catch(() => {})
   }, [workspaceId])
 
-  // Load API key statuses + configs (workspace-level, no employee needed)
+  // Load API key statuses + configs AND persisted OAuth statuses from Supabase
   useEffect(() => {
     fetch(`/api/integrations?workspace_id=${workspaceId}`)
       .then(r => r.ok ? r.json() : [])
-      .then((data: { type: string; status: string; config: Record<string, string> }[]) => {
-        const statuses: Record<string, ConnectionStatus> = {}
+      .then((data: { type: string; status: string; config: Record<string, string>; employee_id?: string }[]) => {
+        const apikeyStatusMap: Record<string, ConnectionStatus> = {}
         const configs: Record<string, Record<string, string>> = {}
+        const oauthStatusMap: Record<string, Record<string, ConnectionStatus>> = {} // employeeId -> appKey -> status
+
         for (const row of data) {
           const appKey = row.type
           if (INTEGRATIONS[appKey]?.authType === 'apikey') {
-            statuses[appKey] = row.status === 'connected' ? 'connected' : 'none'
+            apikeyStatusMap[appKey] = row.status === 'connected' ? 'connected' : 'none'
             configs[appKey] = row.config ?? {}
+          } else if (INTEGRATIONS[appKey]?.authType === 'oauth' && row.employee_id) {
+            if (!oauthStatusMap[row.employee_id]) oauthStatusMap[row.employee_id] = {}
+            oauthStatusMap[row.employee_id][appKey] = row.status === 'connected' ? 'connected' : 'none'
           }
         }
-        setApikeyStatuses(statuses)
+        setApikeyStatuses(apikeyStatusMap)
         setSavedConfigs(configs)
+        // Seed OAuth statuses from Supabase so they survive refresh immediately
+        setPersistedOauthStatuses(oauthStatusMap)
       })
       .catch(() => {})
   }, [workspaceId])
 
-  // Fetch OAuth statuses for selected employee
+  // Fetch OAuth statuses for selected employee — verifies live status with Nango
   const fetchOauthStatuses = useCallback(async (employeeId: string) => {
     if (!employeeId) return
     const entityId = `ws:${workspaceId}:emp:${employeeId}`
     const oauthKeys = Object.keys(INTEGRATIONS).filter(k => INTEGRATIONS[k].authType === 'oauth')
 
-    const loading: Record<string, ConnectionStatus> = {}
-    for (const k of oauthKeys) loading[k] = 'loading'
-    setOauthStatuses(loading)
+    // Show loading only for keys not already known from Supabase
+    setOauthStatuses(prev => {
+      const next = { ...prev }
+      for (const k of oauthKeys) {
+        if (!next[k] || next[k] === 'none') next[k] = 'loading'
+      }
+      return next
+    })
 
     const results = await Promise.allSettled(
       oauthKeys.map(async (appKey) => {
@@ -394,8 +418,24 @@ export default function IntegrationsPage() {
       })
 
       await nango.auth(INTEGRATIONS[appKey].nangoApp!)
+      // Persist OAuth connection to Supabase so it survives page refresh
+      await fetch('/api/integrations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspace_id: workspaceId,
+          type: appKey,
+          status: 'connected',
+          employee_id: selectedEmployeeId,
+          config: {},
+        }),
+      })
       showToast(`${INTEGRATIONS[appKey].name} connected!`)
       setOauthStatuses(p => ({ ...p, [appKey]: 'connected' }))
+      setPersistedOauthStatuses(p => ({
+        ...p,
+        [selectedEmployeeId]: { ...(p[selectedEmployeeId] ?? {}), [appKey]: 'connected' },
+      }))
     } catch (err) {
       const rawMsg = (err as Error).message || ''
       const friendly = rawMsg.includes('Integration does not exist')
@@ -422,8 +462,18 @@ export default function IntegrationsPage() {
         body: JSON.stringify({ entityId, app: appKey }),
       })
       if (!res.ok) { const e = await res.json(); throw new Error(e.error ?? 'Failed') }
+      // Remove from Supabase so it doesn't show as connected on next refresh
+      await fetch('/api/integrations/disconnect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace_id: workspaceId, type: appKey, employee_id: selectedEmployeeId }),
+      })
       showToast(`${INTEGRATIONS[appKey]?.name} disconnected.`)
       setOauthStatuses(p => ({ ...p, [appKey]: 'none' }))
+      setPersistedOauthStatuses(p => ({
+        ...p,
+        [selectedEmployeeId]: { ...(p[selectedEmployeeId] ?? {}), [appKey]: 'none' },
+      }))
     } catch (err) {
       showToast(`Disconnect failed: ${(err as Error).message}`)
     } finally {
@@ -476,7 +526,15 @@ export default function IntegrationsPage() {
   const getStatus = (appKey: string): ConnectionStatus => {
     const meta = INTEGRATIONS[appKey]
     if (!meta) return 'none'
-    if (meta.authType === 'oauth') return selectedEmployeeId ? (oauthStatuses[appKey] ?? 'none') : 'none'
+    if (meta.authType === 'oauth') {
+      if (!selectedEmployeeId) return 'none'
+      const liveStatus = oauthStatuses[appKey]
+      // If Nango check is still loading, show persisted Supabase status instantly
+      if (liveStatus === 'loading' || liveStatus === undefined) {
+        return persistedOauthStatuses[selectedEmployeeId]?.[appKey] ?? 'loading'
+      }
+      return liveStatus
+    }
     return apikeyStatuses[appKey] ?? 'none'
   }
 

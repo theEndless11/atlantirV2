@@ -22,21 +22,29 @@ export async function GET(req: Request) {
   if (!workspaceId) return NextResponse.json({ error: 'workspace_id required' }, { status: 400 })
 
   const sb = supabaseAdmin()
-  const { data } = await sb.from('integrations').select('type,status,config,id').eq('workspace_id', workspaceId)
+  const { data } = await sb.from('integrations').select('type,status,config,id,employee_id').eq('workspace_id', workspaceId)
   return NextResponse.json((data || []).map(i => ({
     type: i.type, status: i.status,
     config: i.config ? stripSecrets(i.config as Record<string, any>) : {},
     id: i.id,
+    employee_id: i.employee_id ?? null,
   })))
 }
 
 export async function POST(req: Request) {
   const body = await req.json()
-  const { workspace_id, type, config, status } = body
+  const { workspace_id, type, config, status, employee_id } = body
   if (!workspace_id || !type) return NextResponse.json({ error: 'workspace_id and type required' }, { status: 400 })
 
   const sb = supabaseAdmin()
-  const { data: existing } = await sb.from('integrations').select('config').eq('workspace_id', workspace_id).eq('type', type).single()
+
+  // Build conflict key: OAuth integrations are per-employee, API key integrations are per-workspace
+  const conflictColumns = employee_id ? 'workspace_id,type,employee_id' : 'workspace_id,type'
+
+  // Fetch existing config to merge (avoid overwriting with masked values)
+  let existingQuery = sb.from('integrations').select('config').eq('workspace_id', workspace_id).eq('type', type)
+  if (employee_id) existingQuery = existingQuery.eq('employee_id', employee_id)
+  const { data: existing } = await existingQuery.single()
 
   const existingConfig: Record<string, string> = (existing?.config as any) || {}
   const incomingConfig: Record<string, string> = config || {}
@@ -45,10 +53,13 @@ export async function POST(req: Request) {
     if (!isMasked(v as string)) mergedConfig[k] = v as string
   }
 
-  const { data, error } = await sb.from('integrations').upsert({
+  const upsertData: Record<string, any> = {
     workspace_id, type, status: status || 'connected', config: mergedConfig,
     updated_at: new Date().toISOString(),
-  }, { onConflict: 'workspace_id,type' }).select().single()
+  }
+  if (employee_id) upsertData.employee_id = employee_id
+
+  const { data, error } = await sb.from('integrations').upsert(upsertData, { onConflict: conflictColumns }).select().single()
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
   return NextResponse.json({ id: data.id, type: data.type, status: data.status })

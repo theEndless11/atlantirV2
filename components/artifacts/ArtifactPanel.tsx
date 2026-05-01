@@ -1,23 +1,12 @@
 'use client'
 
-/**
- * components/artifacts/ArtifactPanel.tsx
- *
- * Renders an artifact in the task sidebar.
- * Each type dispatches to its own renderer component.
- * Lifecycle buttons: Review → Approve → Execute / Request Changes
- */
-
 import { useState, useTransition } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
-import { CheckCircle, Send, Eye, RotateCcw, FileText, Mail, BarChart2, Code2, Presentation, Video } from 'lucide-react'
-import type { Artifact } from '@/types'
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+import { CheckCircle, Send, Eye, RotateCcw, FileText, Mail, BarChart2, Code2, Presentation, Video, Table2 } from 'lucide-react'
+import type { Artifact, DataGridContent } from '@/types'
+import { DataGridRenderer } from './DataGridRenderer'
 
 const STATE_BADGE: Record<Artifact['state'], { label: string; variant: 'secondary' | 'outline' | 'default' | 'destructive' }> = {
   draft:    { label: 'Draft',    variant: 'secondary' },
@@ -33,11 +22,10 @@ const TYPE_ICON: Record<Artifact['type'], React.ReactNode> = {
   code:     <Code2 className="h-4 w-4" />,
   slides:   <Presentation className="h-4 w-4" />,
   video:    <Video className="h-4 w-4" />,
+  datagrid: <Table2 className="h-4 w-4" />,
+  other:    <FileText className="h-4 w-4" />,
+  research: <FileText className="h-4 w-4" />,
 }
-
-// ---------------------------------------------------------------------------
-// Per-type renderers (minimal v1 — upgraded per type over time)
-// ---------------------------------------------------------------------------
 
 function DocumentRenderer({ content }: { content: { markdown: string } }) {
   return (
@@ -99,21 +87,28 @@ function GenericRenderer({ content }: { content: Record<string, unknown> }) {
   )
 }
 
-function ArtifactContent({ artifact }: { artifact: Artifact }) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+function ArtifactContent({
+  artifact,
+  onDataGridChange,
+}: {
+  artifact: Artifact
+  onDataGridChange?: (content: DataGridContent) => void
+}) {
   const c = artifact.content as any
   switch (artifact.type) {
     case 'document': return <DocumentRenderer content={c} />
     case 'email':    return <EmailRenderer content={c} />
     case 'chart':    return <ChartRenderer content={c} />
     case 'code':     return <CodeRenderer content={c} />
-    default:         return <GenericRenderer content={c} />
+    case 'datagrid': return (
+      <DataGridRenderer
+        artifact={artifact as any}
+        onDataChange={onDataGridChange}
+      />
+    )
+    default: return <GenericRenderer content={c} />
   }
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle action handler
-// ---------------------------------------------------------------------------
 
 async function transitionArtifact(
   artifactId: string,
@@ -129,22 +124,20 @@ async function transitionArtifact(
   return res.json()
 }
 
-// ---------------------------------------------------------------------------
-// Main component
-// ---------------------------------------------------------------------------
-
 interface ArtifactPanelProps {
   artifact: Artifact
   workspaceId: string
   onUpdate?: (updated: Artifact) => void
+  onDataGridChange?: (content: DataGridContent) => void
 }
 
-export function ArtifactPanel({ artifact, workspaceId, onUpdate }: ArtifactPanelProps) {
+export function ArtifactPanel({ artifact, workspaceId, onUpdate, onDataGridChange }: ArtifactPanelProps) {
   const [current, setCurrent] = useState(artifact)
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState<string | null>(null)
 
-  const badge = STATE_BADGE[current.state]
+  const badge = STATE_BADGE[current.state] ?? { label: current.state, variant: 'secondary' as const }
+  const icon = TYPE_ICON[current.type] ?? <FileText className="h-4 w-4" />
 
   function handleTransition(action: 'review' | 'approve' | 'execute') {
     setError(null)
@@ -161,10 +154,9 @@ export function ArtifactPanel({ artifact, workspaceId, onUpdate }: ArtifactPanel
 
   return (
     <div className="rounded-lg border bg-card text-card-foreground shadow-sm overflow-hidden">
-      {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/40">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-muted-foreground shrink-0">{TYPE_ICON[current.type]}</span>
+          <span className="text-muted-foreground shrink-0">{icon}</span>
           <span className="font-medium text-sm truncate">{current.title}</span>
           {current.version > 1 && (
             <span className="text-xs text-muted-foreground shrink-0">v{current.version}</span>
@@ -173,12 +165,10 @@ export function ArtifactPanel({ artifact, workspaceId, onUpdate }: ArtifactPanel
         <Badge variant={badge.variant} className="shrink-0 ml-2 text-xs">{badge.label}</Badge>
       </div>
 
-      {/* Content */}
       <div className="p-4 max-h-[420px] overflow-y-auto">
-        <ArtifactContent artifact={current} />
+        <ArtifactContent artifact={current} onDataGridChange={onDataGridChange} />
       </div>
 
-      {/* Lifecycle actions */}
       {current.state !== 'executed' && (
         <>
           <Separator />
@@ -187,20 +177,14 @@ export function ArtifactPanel({ artifact, workspaceId, onUpdate }: ArtifactPanel
 
             <div className="flex gap-2 ml-auto">
               {current.state === 'draft' && (
-                <Button
-                  size="sm" variant="outline" disabled={isPending}
-                  onClick={() => handleTransition('review')}
-                >
+                <Button size="sm" variant="outline" disabled={isPending} onClick={() => handleTransition('review')}>
                   <Eye className="h-3.5 w-3.5 mr-1.5" />
                   Mark Reviewed
                 </Button>
               )}
 
               {current.state === 'reviewed' && (
-                <Button
-                  size="sm" variant="outline" disabled={isPending}
-                  onClick={() => handleTransition('approve')}
-                >
+                <Button size="sm" variant="outline" disabled={isPending} onClick={() => handleTransition('approve')}>
                   <CheckCircle className="h-3.5 w-3.5 mr-1.5" />
                   Approve
                 </Button>
@@ -208,17 +192,11 @@ export function ArtifactPanel({ artifact, workspaceId, onUpdate }: ArtifactPanel
 
               {current.state === 'approved' && (
                 <>
-                  <Button
-                    size="sm" variant="outline" disabled={isPending}
-                    onClick={() => handleTransition('review')}
-                  >
+                  <Button size="sm" variant="outline" disabled={isPending} onClick={() => handleTransition('review')}>
                     <RotateCcw className="h-3.5 w-3.5 mr-1.5" />
                     Request Changes
                   </Button>
-                  <Button
-                    size="sm" disabled={isPending}
-                    onClick={() => handleTransition('execute')}
-                  >
+                  <Button size="sm" disabled={isPending} onClick={() => handleTransition('execute')}>
                     <Send className="h-3.5 w-3.5 mr-1.5" />
                     Execute
                   </Button>

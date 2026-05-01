@@ -1,6 +1,8 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { createBrowserClient } from '@supabase/ssr'
 import Link from 'next/link'
 
 const agents = [
@@ -36,6 +38,27 @@ const plans = [
 
 export default function LandingPage() {
   const year = new Date().getFullYear()
+  const router = useRouter()
+
+  useEffect(() => {
+    const supabase = createBrowserClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+    )
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (!session) return
+      const { data: ws } = await supabase
+        .from('workspace_members')
+        .select('workspace_id')
+        .eq('user_id', session.user.id)
+        .order('created_at')
+        .limit(1)
+        .single()
+      if (ws) router.replace(`/workspace/${ws.workspace_id}`)
+      else router.replace('/onboarding')
+    })
+  }, [])
+
   const webglRef = useRef<HTMLCanvasElement>(null)
   const chartBarRef = useRef<HTMLCanvasElement>(null)
   const chartLineRef = useRef<HTMLCanvasElement>(null)
