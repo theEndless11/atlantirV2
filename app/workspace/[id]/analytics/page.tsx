@@ -2,9 +2,7 @@
 
 import { useState, useEffect, useMemo } from 'react'
 import { useParams } from 'next/navigation'
-
-const _cache: Record<string, { data: any; ts: number }> = {}
-const CACHE_TTL = 60_000
+import { swr } from '@/lib/tab-cache'
 
 const STATUS_LABELS: Record<string, string> = {
   pending_approval: 'Pending', approved: 'Approved', in_progress: 'Running',
@@ -38,28 +36,13 @@ export default function AnalyticsPage() {
   function pct(v: number, total: number) { return total > 0 ? Math.round((v / total) * 100) : 0 }
   function usagePct(v: number, max: number) { return max > 0 ? Math.round((v / max) * 100) : 0 }
 
-  async function load(silent = false) {
-    if (!silent) setLoading(true)
-    try {
-      const key = `${workspaceId}:${days}`
-      const res = await fetch(`/api/analytics?workspace_id=${workspaceId}&days=${days}`)
-      const data = await res.json()
-      _cache[key] = { data, ts: Date.now() }
-      setStats(data)
-    } finally { if (!silent) setLoading(false) }
-  }
-
   useEffect(() => {
-    const key = `${workspaceId}:${days}`
-    const cached = _cache[key]
-    if (cached) {
-      setStats(cached.data)
-      setLoading(false)
-      if (Date.now() - cached.ts < CACHE_TTL) return // fresh — skip refetch
-      load(true) // stale — revalidate silently
-    } else {
-      load()
-    }
+    swr(
+      `analytics:${workspaceId}:${days}`,
+      () => fetch(`/api/analytics?workspace_id=${workspaceId}&days=${days}`).then(r => r.json()),
+      setStats,
+      setLoading,
+    )
   }, [workspaceId, days])
 
   return (

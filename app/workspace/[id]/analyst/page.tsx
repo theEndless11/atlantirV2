@@ -2,7 +2,9 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { useParams } from 'next/navigation'
-import { createClient } from '@/lib/supabase-browser'
+import { swr } from '@/lib/tab-cache'
+import { Maximize2, X, BarChart2, Table2, MessageSquare } from 'lucide-react'
+import { MarkdownRenderer } from '@/components/MarkdownRenderer'
 
 interface DataSource {
   id: string; name: string; type: string; rows: number; cols: number
@@ -11,7 +13,10 @@ interface DataSource {
 }
 interface DbConnection { id: string; name: string; type: string; status: string; tables?: string[] }
 interface Insight { question: string; answer: string; chartData?: any; keyMetrics?: { label: string; value: string }[]; pinned?: boolean }
-interface ChatMsg { id: string; role: string; content: string; time: string; user_name?: string; pending_write?: string }
+interface ChatMsg {
+  id: string; role: string; content: string; time: string; user_name?: string; pending_write?: string
+  artifact?: { type: 'table' | 'graph'; title: string; data: any }
+}
 
 const DB_CONFIGS: Record<string, any> = {
   postgres:    { host: 'localhost', port: '5432', user: 'postgres', database: 'mydb', dbLabel: 'Database', connStr: 'postgresql://user:pass@localhost:5432/mydb', connHint: 'Standard PostgreSQL URL' },
@@ -49,13 +54,8 @@ function inferStats(data: Record<string, any>[], columns: string[]) {
   })
 }
 function cellVal(v: any): string { if (v === undefined || v === null) return '-'; return String(v) }
-function renderMd(text: string): string {
-  if (!text) return ''
-  return text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/^### (.*)/gm, '<h4>$1</h4>').replace(/^## (.*)/gm, '<h3>$1</h3>').replace(/^- (.*)/gm, '<li>$1</li>').replace(/`(.*?)`/g, '<code>$1</code>').replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')
-}
 
-const TABS = [{ id: 'analysis', label: 'Analysis' }, { id: 'sql', label: 'SQL' }, { id: 'charts', label: 'Charts' }, { id: 'summary', label: 'Report' }]
-const CHART_TYPES = ['bar','line','pie','scatter','doughnut','radar']
+const TABS = [{ id: 'analysis', label: 'Analysis' }, { id: 'sql', label: 'SQL' }, { id: 'chat', label: 'Chat' }, { id: 'summary', label: 'Report' }]
 const DB_TYPES = ['postgres','mysql','mariadb','mssql','sqlite','mongodb','redis','cassandra','scylla','clickhouse','bigquery','snowflake','supabase','planetscale','turso','duckdb']
 const SQL_EXAMPLES = ['SELECT * FROM orders LIMIT 10', 'SELECT category, SUM(revenue) FROM sales GROUP BY category', 'SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL 30 DAY']
 
@@ -72,6 +72,111 @@ const SAMPLE_DATA = [
   { month:'Oct',revenue:71000,expenses:38000,profit:33000,units:575,region:'West',product:'Enterprise' },
   { month:'Nov',revenue:84000,expenses:42000,profit:42000,units:680,region:'North',product:'Pro' },
   { month:'Dec',revenue:92000,expenses:45000,profit:47000,units:745,region:'West',product:'Enterprise' },
+]
+
+// ── Fullscreen Modal ─────────────────────────────────────────────────────────
+function FullscreenModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode | React.ReactNode[] }) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', h)
+    return () => document.removeEventListener('keydown', h)
+  }, [onClose])
+  return (
+    <div style={{ position:'fixed',inset:0,zIndex:1000,background:'rgba(0,0,0,0.75)',backdropFilter:'blur(4px)',display:'flex',flexDirection:'column' }}>
+      <div style={{ background:'var(--surface)',borderBottom:'1px solid var(--border)',display:'flex',alignItems:'center',padding:'12px 20px',gap:12,flexShrink:0 }}>
+        <span style={{ fontSize:15,fontWeight:700,color:'var(--text-1)',flex:1 }}>{title}</span>
+        <button onClick={onClose} style={{ background:'none',border:'none',cursor:'pointer',color:'var(--text-3)',padding:6,borderRadius:6,display:'flex' }}>
+          <X width={18} height={18} />
+        </button>
+      </div>
+      <div style={{ flex:1,overflow:'auto',padding:32 }}>{children}</div>
+    </div>
+  )
+}
+
+// ── Table Renderer ───────────────────────────────────────────────────────────
+function TableWidget({ columns, rows, fullscreen }: { columns: string[]; rows: Record<string,any>[]; fullscreen?: boolean }) {
+  const [sortCol, setSortCol] = useState<string|null>(null)
+  const [sortDir, setSortDir] = useState<'asc'|'desc'>('asc')
+  const [filter, setFilter] = useState('')
+  let data = rows
+  if (filter) { const q=filter.toLowerCase(); data=data.filter(r=>columns.some(c=>String(r[c]??'').toLowerCase().includes(q))) }
+  if (sortCol) {
+    data=[...data].sort((a,b)=>{
+      const [av,bv]=[a[sortCol],b[sortCol]]
+      const [an,bn]=[parseFloat(av),parseFloat(bv)]
+      if(!isNaN(an)&&!isNaN(bn)) return sortDir==='asc'?an-bn:bn-an
+      return sortDir==='asc'?String(av).localeCompare(String(bv)):String(bv).localeCompare(String(av))
+    })
+  }
+  return (
+    <div style={{ display:'flex',flexDirection:'column',gap:8,height:'100%' }}>
+      <input value={filter} onChange={e=>setFilter(e.target.value)} placeholder="Filter rows..." style={{ padding:'6px 10px',border:'1.5px solid var(--border)',borderRadius:7,fontSize:12,background:'var(--surface)',color:'var(--text-1)',outline:'none',width:fullscreen?300:180,boxSizing:'border-box' }} />
+      <div style={{ flex:1,overflow:'auto',border:'1px solid var(--border)',borderRadius:8 }}>
+        <table style={{ width:'100%',borderCollapse:'collapse',fontSize:fullscreen?14:12 }}>
+          <thead><tr>{columns.map(col=>(
+            <th key={col} onClick={()=>{ if(sortCol===col)setSortDir(d=>d==='asc'?'desc':'asc'); else{setSortCol(col);setSortDir('asc')} }}
+              style={{ padding:fullscreen?'10px 14px':'7px 10px',textAlign:'left',fontWeight:600,color:'var(--text-2)',fontSize:fullscreen?12:10,textTransform:'uppercase',background:'var(--surface-2)',position:'sticky',top:0,borderBottom:'1px solid var(--border)',cursor:'pointer',userSelect:'none',whiteSpace:'nowrap' }}>
+              {col}{sortCol===col?sortDir==='asc'?' ↑':' ↓':''}
+            </th>
+          ))}</tr></thead>
+          <tbody>{data.map((row,i)=>(
+            <tr key={i} style={{ background:i%2===0?'var(--surface)':'var(--surface-2)' }}>
+              {columns.map(col=><td key={col} style={{ padding:fullscreen?'8px 14px':'5px 10px',borderBottom:'1px solid var(--border-soft)',color:'var(--text-1)',whiteSpace:'nowrap' }}>{cellVal(row[col])}</td>)}
+            </tr>
+          ))}</tbody>
+        </table>
+        {data.length===0 && <div style={{ textAlign:'center',padding:20,color:'var(--text-3)',fontSize:12 }}>No results</div>}
+      </div>
+      <div style={{ fontSize:10,color:'var(--text-3)' }}>{data.length} of {rows.length} rows</div>
+    </div>
+  )
+}
+
+// ── Graph Renderer ───────────────────────────────────────────────────────────
+function GraphWidget({ chartData, fullscreen }: { chartData: any; fullscreen?: boolean }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const chartRef = useRef<any>(null)
+  const [ready, setReady] = useState(false)
+
+  useEffect(() => {
+    if (!(window as any).Chart) {
+      const s=document.createElement('script'); s.src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js'; s.onload=()=>setReady(true); document.head.appendChild(s)
+    } else setReady(true)
+  }, [])
+
+  useEffect(() => {
+    if (!ready||!canvasRef.current||!chartData) return
+    const Chart=(window as any).Chart
+    if(chartRef.current){chartRef.current.destroy();chartRef.current=null}
+    const colors=['#6366f1','#10b981','#f59e0b','#ef4444','#3b82f6','#8b5cf6','#ec4899','#14b8a6']
+    const datasets=(chartData.datasets||[]).map((ds:any,i:number)=>({
+      label:ds.label,data:ds.data,
+      backgroundColor:ds.color||(chartData.type==='line'?'transparent':colors[i%colors.length]+'99'),
+      borderColor:ds.color||colors[i%colors.length],
+      borderWidth:2,fill:chartData.type==='area',tension:0.4
+    }))
+    chartRef.current=new Chart(canvasRef.current,{
+      type:chartData.type==='area'?'line':chartData.type||'bar',
+      data:{labels:chartData.labels||[],datasets},
+      options:{
+        responsive:true,maintainAspectRatio:!fullscreen,
+        plugins:{legend:{position:'bottom',labels:{font:{size:fullscreen?13:11}}},title:chartData.title?{display:true,text:chartData.title,font:{size:fullscreen?16:13,weight:'600'}}:undefined},
+        scales:['bar','line','scatter','area'].includes(chartData.type)?{x:{ticks:{font:{size:fullscreen?12:10}}},y:{ticks:{font:{size:fullscreen?12:10}}}}:undefined
+      }
+    })
+    return ()=>{if(chartRef.current){chartRef.current.destroy();chartRef.current=null}}
+  },[ready,chartData,fullscreen])
+
+  if(!ready) return <div style={{padding:20,color:'var(--text-3)',fontSize:13}}>Loading chart...</div>
+  return <canvas ref={canvasRef} style={{ width:'100%',maxHeight:fullscreen?'calc(100vh - 160px)':280 }} />
+}
+
+// ── Chat capability bubbles ───────────────────────────────────────────────────
+const CHAT_CAPABILITY_BUBBLES = [
+  { icon: <BarChart2 width={12} height={12}/>, label: 'Ask for graphs', text: 'Show me a bar chart of revenue by month' },
+  { icon: <Table2 width={12} height={12}/>, label: 'Get tables', text: 'Give me a table of top 10 products by profit' },
+  { icon: <MessageSquare width={12} height={12}/>, label: 'Deep analysis', text: 'What are the key trends in this data?' },
 ]
 
 export default function AnalystPage() {
@@ -93,8 +198,6 @@ export default function AnalystPage() {
   const [sqlQuery, setSqlQuery] = useState('')
   const [sqlResult, setSqlResult] = useState<any>(null)
   const [runningSQL, setRunningSQL] = useState(false)
-  const [chartConfig, setChartConfig] = useState({ type: 'bar', x: '', y: '' })
-  const [chartBuilt, setChartBuilt] = useState(false)
   const [summaryData, setSummaryData] = useState<any>(null)
   const [generatingSummary, setGeneratingSummary] = useState(false)
   const [showDbModal, setShowDbModal] = useState(false)
@@ -107,6 +210,7 @@ export default function AnalystPage() {
   const [dbError, setDbError] = useState('')
   const [dbTestStatus, setDbTestStatus] = useState('')
   const [dbForm, setDbForm] = useState({ type: 'postgres', name: '', host: '', port: '', database: '', username: '', password: '', connectionString: '', useConnStr: false, ssl: false, extra: '' })
+  const [fullscreenArtifact, setFullscreenArtifact] = useState<{ type: 'table'|'graph'; title: string; data: any } | null>(null)
 
   const chatEl = useRef<HTMLDivElement>(null)
 
@@ -189,17 +293,19 @@ export default function AnalystPage() {
     } finally { setAnalyzing(false) }
   }
 
-  async function sendChatMessage() {
-    if (!chatInput.trim() || chatThinking) return
-    const text = chatInput.trim(); setChatInput('')
-    const userMsg: ChatMsg = { id: String(Date.now()), role: 'user', content: text, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
+  async function sendChatMessage(text?: string) {
+    const msg = (text || chatInput).trim()
+    if (!msg || chatThinking) return
+    setChatInput('')
+    const userMsg: ChatMsg = { id: String(Date.now()), role: 'user', content: msg, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
     setChatMessages(prev => [...prev, userMsg])
     setTimeout(() => { if (chatEl.current) chatEl.current.scrollTop = chatEl.current.scrollHeight }, 0)
     setChatThinking(true)
     try {
       const history = chatMessages.slice(-10).map(m => ({ role: m.role, content: m.content }))
-      const res = await fetch('/api/analyst/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: text, history, data_context: buildDataContext(), workspace_id: workspaceId, connection_id: activeDb?.id || null, db_tables: dbPreview?.tables || [], db_name: activeDb?.name || null, db_type: activeDb?.type || null }) }).then(r => r.json())
-      setChatMessages(prev => [...prev, { id: String(Date.now() + 1), role: 'assistant', content: res.reply, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), pending_write: res.pending_write || undefined }])
+      const res = await fetch('/api/analyst/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg, history, data_context: buildDataContext(), workspace_id: workspaceId, connection_id: activeDb?.id || null, db_tables: dbPreview?.tables || [], db_name: activeDb?.name || null, db_type: activeDb?.type || null }) }).then(r => r.json())
+      const assistantMsg: ChatMsg = { id: String(Date.now() + 1), role: 'assistant', content: res.reply, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), pending_write: res.pending_write || undefined, artifact: res.artifact || undefined }
+      setChatMessages(prev => [...prev, assistantMsg])
     } catch (e: any) {
       setChatMessages(prev => [...prev, { id: String(Date.now() + 1), role: 'assistant', content: e?.message || 'Something went wrong.', time: '' }])
     } finally {
@@ -242,19 +348,6 @@ export default function AnalystPage() {
     const rows = [sqlResult.columns.join(',')]
     sqlResult.data.forEach((r: any) => rows.push(sqlResult.columns.map((c: string) => cellVal(r[c])).join(',')))
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' })); a.download = `query-${Date.now()}.csv`; a.click()
-  }
-
-  function buildChart() {
-    if (!activeSource) return
-    const labels = activeSource.data.map(r => cellVal(r[chartConfig.x])).slice(0, 50)
-    const values = activeSource.data.map(r => parseFloat(r[chartConfig.y]) || 0).slice(0, 50)
-    setChartBuilt(true)
-    setTimeout(() => {
-      const canvas = document.getElementById('builder-chart') as HTMLCanvasElement
-      if (!canvas || !(window as any).Chart) return
-      const existing = (window as any).Chart.getChart(canvas); if (existing) existing.destroy()
-      new (window as any).Chart(canvas, { type: chartConfig.type, data: { labels, datasets: [{ label: chartConfig.y, data: values, backgroundColor: '#6366f1', borderColor: '#6366f1', fill: false }] }, options: { responsive: true, plugins: { legend: { position: 'bottom' } } } })
-    }, 0)
   }
 
   async function generateSummary() {
@@ -300,10 +393,14 @@ export default function AnalystPage() {
   }
 
   async function loadSavedConnections() {
-    try {
-      const data = await fetch(`/api/analyst/db-list?workspace_id=${workspaceId}`).then(r => r.json())
-      if (data && data.length) setDbConnections(data.map((d: any) => ({ id: d.id, name: d.name || d.type, type: d.type, status: d.status, tables: d.tables || [] })))
-    } catch {}
+    await swr(
+      `analyst:dbs:${workspaceId}`,
+      () => fetch(`/api/analyst/db-list?workspace_id=${workspaceId}`).then(r => r.json()),
+      (data) => {
+        if (data && data.length)
+          setDbConnections(data.map((d: any) => ({ id: d.id, name: d.name || d.type, type: d.type, status: d.status, tables: d.tables || [] })))
+      },
+    )
   }
 
   useEffect(() => {
@@ -313,12 +410,10 @@ export default function AnalystPage() {
     }
   }, [])
 
-  useEffect(() => {
-    if (activeSource) { setChartConfig(c => ({ ...c, x: activeSource.columns[0], y: numericCols[0] || activeSource.columns[1] || '' })) }
-  }, [activeSource])
+  const DISPLAY_TABS = TABS
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: activeDb ? '200px 1fr 300px' : '200px 1fr', height: '100%', overflow: 'hidden' }}>
+    <div style={{ display: 'grid', gridTemplateColumns: '200px 1fr', height: '100%', overflow: 'hidden' }}>
 
       {/* Sources panel */}
       <aside style={{ borderRight: '1px solid var(--border)', background: 'var(--surface)', overflowY: 'auto', display: 'flex', flexDirection: 'column', paddingBottom: 12 }}>
@@ -366,7 +461,7 @@ export default function AnalystPage() {
       <main style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* Tab bar */}
         <div style={{ display: 'flex', alignItems: 'center', padding: '0 14px', borderBottom: '1px solid var(--border)', background: 'var(--surface)', flexShrink: 0, gap: 2 }}>
-          {TABS.map(tab => (
+          {DISPLAY_TABS.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{ padding: '10px 14px', fontSize: 13, color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-3)', background: 'none', border: 'none', cursor: 'pointer', borderBottom: `2px solid ${activeTab === tab.id ? 'var(--accent)' : 'transparent'}`, marginBottom: -1, fontWeight: activeTab === tab.id ? 500 : 400 }}>
               {tab.label}
             </button>
@@ -382,7 +477,7 @@ export default function AnalystPage() {
               <>
                 <div style={{ padding: '10px 14px', background: 'var(--surface)', borderBottom: '1px solid var(--border-soft)', flexShrink: 0 }}>
                   <div style={{ display: 'flex', gap: 6, marginBottom: 7 }}>
-                    <input value={question} onChange={e => setQuestion(e.target.value)} onKeyUp={e => e.key === 'Enter' && analyzeQuestion()} className="q-input" placeholder="Ask anything about your data..." style={{ flex: 1, padding: '8px 12px', border: '1.5px solid var(--border)', borderRadius: 8, fontSize: 13, fontFamily: 'inherit', background: 'var(--surface)', color: 'var(--text-1)', outline: 'none' }} />
+                    <input value={question} onChange={e => setQuestion(e.target.value)} onKeyUp={e => e.key === 'Enter' && analyzeQuestion()} placeholder="Ask anything about your data..." style={{ flex: 1, padding: '8px 12px', border: '1.5px solid var(--border)', borderRadius: 8, fontSize: 13, fontFamily: 'inherit', background: 'var(--surface)', color: 'var(--text-1)', outline: 'none' }} />
                     <button disabled={!question.trim() || analyzing} onClick={analyzeQuestion} style={{ padding: '8px 16px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 500, cursor: !question.trim() || analyzing ? 'not-allowed' : 'pointer', opacity: !question.trim() || analyzing ? 0.4 : 1, display: 'flex', alignItems: 'center', gap: 5 }}>
                       {analyzing ? <span style={{ width: 12, height: 12, borderRadius: '50%', border: '2px solid rgba(255,255,255,.3)', borderTopColor: '#fff', animation: 'spin .7s linear infinite', display: 'inline-block' }} /> : 'Go'}
                     </button>
@@ -429,10 +524,12 @@ export default function AnalystPage() {
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'var(--surface-2)', borderBottom: '1px solid var(--border-soft)' }}>
                           <div style={{ flex: 1, fontSize: 12, fontWeight: 500, color: 'var(--text-1)' }}>{ins.question}</div>
                           <div style={{ display: 'flex', gap: 4 }}>
-                            {['pin','export','remove'].map(a => <button key={a} onClick={() => { if (a==='remove') setInsights(prev => prev.filter((_,j)=>j!==i)); else if (a==='pin') setInsights(prev => prev.map((x,j) => j===i ? {...x,pinned:!x.pinned} : x)) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', fontSize: 11, padding: '2px 6px', borderRadius: 4 }}>{a==='pin' ? (ins.pinned ? 'unpin' : 'pin') : a}</button>)}
+                            {['pin','remove'].map(a => <button key={a} onClick={() => { if (a==='remove') setInsights(prev => prev.filter((_,j)=>j!==i)); else setInsights(prev => prev.map((x,j) => j===i ? {...x,pinned:!x.pinned} : x)) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', fontSize: 11, padding: '2px 6px', borderRadius: 4 }}>{a==='pin' ? (ins.pinned ? 'unpin' : 'pin') : a}</button>)}
                           </div>
                         </div>
-                        <div style={{ padding: '10px 14px', fontSize: 13, lineHeight: 1.7, color: 'var(--text-1)' }} dangerouslySetInnerHTML={{ __html: renderMd(ins.answer) }} />
+                        <div style={{ padding: '10px 14px' }}>
+                          <MarkdownRenderer content={ins.answer} size="sm" />
+                        </div>
                         {ins.keyMetrics && ins.keyMetrics.length > 0 && (
                           <div style={{ display: 'flex', gap: 8, padding: '0 12px 12px', flexWrap: 'wrap' }}>
                             {ins.keyMetrics.map(m => <div key={m.label} style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 7, padding: '6px 10px' }}><div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text-1)', lineHeight: 1 }}>{m.value}</div><div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>{m.label}</div></div>)}
@@ -487,7 +584,10 @@ export default function AnalystPage() {
                   {sqlResult.query_type === 'write' ? <span style={{ fontSize: 11, fontWeight: 600, color: '#065f46', background: '#d1fae5', padding: '2px 8px', borderRadius: 10 }}>{sqlResult.affected_rows} rows affected</span> : <span>{sqlResult.rows} rows</span>}
                   {sqlResult.truncated && <span style={{ fontSize: 11, color: '#92400e', background: '#fef3c7', padding: '2px 8px', borderRadius: 10 }}>Limited to {sqlLimit}</span>}
                   <span style={{ color: 'var(--text-3)' }}>{sqlResult.time}ms</span>
-                  <button onClick={exportSQL} style={{ marginLeft: 'auto', padding: '4px 10px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 5, fontSize: 11, cursor: 'pointer', color: 'var(--text-2)' }}>Export CSV</button>
+                  <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                    <button onClick={() => setFullscreenArtifact({ type: 'table', title: 'SQL Result', data: { columns: sqlResult.columns, rows: sqlResult.data } })} style={{ padding: '4px 10px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 5, fontSize: 11, cursor: 'pointer', color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 4 }}><Maximize2 width={11} height={11} /> Fullscreen</button>
+                    <button onClick={exportSQL} style={{ padding: '4px 10px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 5, fontSize: 11, cursor: 'pointer', color: 'var(--text-2)' }}>Export CSV</button>
+                  </div>
                 </div>
                 <div style={{ flex: 1, overflow: 'auto' }}>
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
@@ -507,37 +607,88 @@ export default function AnalystPage() {
           </div>
         )}
 
-        {/* Charts tab */}
-        {activeTab === 'charts' && (
-          <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
-            <div style={{ width: 200, borderRight: '1px solid var(--border)', padding: 14, overflowY: 'auto', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 14, background: 'var(--surface)' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.04em' }}>Chart type</label>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
-                  {CHART_TYPES.map(ct => <button key={ct} onClick={() => setChartConfig(c => ({ ...c, type: ct }))} style={{ padding: '6px 4px', background: chartConfig.type === ct ? 'var(--accent-soft)' : 'var(--surface-2)', border: `1px solid ${chartConfig.type === ct ? 'var(--accent-border)' : 'var(--border)'}`, borderRadius: 6, fontSize: 11, cursor: 'pointer', color: chartConfig.type === ct ? 'var(--accent)' : 'var(--text-2)', textAlign: 'center' }}>{ct.charAt(0).toUpperCase() + ct.slice(1)}</button>)}
+        {/* Chat tab */}
+        {activeTab === 'chat' && (
+          <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {/* Capability bubbles */}
+            {!chatMessages.length && (
+              <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-soft)', background: 'var(--surface)', flexShrink: 0 }}>
+                <p style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 10 }}>Chat can generate tables, graphs, and deep analysis. Try:</p>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {CHAT_CAPABILITY_BUBBLES.map(b => (
+                    <button key={b.label} onClick={() => { sendChatMessage(b.text) }} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 12px', background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 20, fontSize: 12, color: 'var(--text-1)', cursor: 'pointer', fontWeight: 500 }}>
+                      <span style={{ color: 'var(--accent)' }}>{b.icon}</span>
+                      {b.label}
+                    </button>
+                  ))}
                 </div>
               </div>
-              {activeSource && (
-                <>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.04em' }}>X axis</label>
-                    <select value={chartConfig.x} onChange={e => setChartConfig(c => ({ ...c, x: e.target.value }))} style={{ padding: '6px 8px', border: '1.5px solid var(--border)', borderRadius: 6, fontSize: 12, background: 'var(--surface)', color: 'var(--text-1)', outline: 'none' }}>
-                      {activeSource.columns.map(col => <option key={col} value={col}>{col}</option>)}
-                    </select>
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.04em' }}>Y axis</label>
-                    <select value={chartConfig.y} onChange={e => setChartConfig(c => ({ ...c, y: e.target.value }))} style={{ padding: '6px 8px', border: '1.5px solid var(--border)', borderRadius: 6, fontSize: 12, background: 'var(--surface)', color: 'var(--text-1)', outline: 'none' }}>
-                      {numericCols.map(col => <option key={col} value={col}>{col}</option>)}
-                    </select>
-                  </div>
-                </>
-              )}
-              <button disabled={!activeSource} onClick={buildChart} style={{ padding: 8, background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 7, fontSize: 13, fontWeight: 500, cursor: activeSource ? 'pointer' : 'not-allowed', opacity: activeSource ? 1 : 0.4, marginTop: 'auto' }}>Build chart</button>
+            )}
+
+            {/* Messages */}
+            <div ref={chatEl} style={{ flex: 1, overflowY: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 16, minHeight: 0 }}>
+              {chatMessages.map(msg => (
+                <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '100%' }}>
+                  {/* Text bubble */}
+                  {msg.content && (
+                    <div style={{ padding: '10px 14px', borderRadius: msg.role === 'user' ? '12px 12px 4px 12px' : '12px 12px 12px 4px', maxWidth: msg.role === 'user' ? '70%' : '90%', background: msg.role === 'user' ? 'linear-gradient(135deg, #4f46e5, #6d28d9)' : 'var(--surface-2)', color: msg.role === 'user' ? '#fff' : 'var(--text-1)', border: msg.role === 'user' ? 'none' : '1px solid var(--border-soft)' }}>
+                      <MarkdownRenderer content={msg.content} bubble={msg.role === 'user'} size="sm" />
+                    </div>
+                  )}
+
+                  {/* Artifact: table */}
+                  {msg.artifact?.type === 'table' && msg.role === 'assistant' && (
+                    <div style={{ width: '100%', maxWidth: 700, border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden', background: 'var(--surface)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--surface-2)', borderBottom: '1px solid var(--border-soft)' }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-1)', display: 'flex', alignItems: 'center', gap: 5 }}><Table2 width={13} height={13} style={{ color: 'var(--accent)' }} />{msg.artifact.title}</span>
+                        <button onClick={() => setFullscreenArtifact(msg.artifact!)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', display: 'flex', padding: 4, borderRadius: 4, alignItems: 'center', gap: 3, fontSize: 11 }}><Maximize2 width={11} height={11} /> Fullscreen</button>
+                      </div>
+                      <div style={{ padding: 12, maxHeight: 260, overflow: 'auto' }}>
+                        <TableWidget columns={msg.artifact.data.columns} rows={msg.artifact.data.rows} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Artifact: graph */}
+                  {msg.artifact?.type === 'graph' && msg.role === 'assistant' && (
+                    <div style={{ width: '100%', maxWidth: 600, border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden', background: 'var(--surface)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--surface-2)', borderBottom: '1px solid var(--border-soft)' }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-1)', display: 'flex', alignItems: 'center', gap: 5 }}><BarChart2 width={13} height={13} style={{ color: 'var(--accent)' }} />{msg.artifact.title}</span>
+                        <button onClick={() => setFullscreenArtifact(msg.artifact!)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', display: 'flex', padding: 4, borderRadius: 4, alignItems: 'center', gap: 3, fontSize: 11 }}><Maximize2 width={11} height={11} /> Fullscreen</button>
+                      </div>
+                      <div style={{ padding: 12 }}>
+                        <GraphWidget chartData={msg.artifact.data} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Write confirm */}
+                  {msg.pending_write && (
+                    <div style={{ background: '#fef3c7', border: '1px solid #fcd34d', borderRadius: 8, padding: '10px 12px', marginTop: 4, display: 'flex', flexDirection: 'column', gap: 7, maxWidth: '90%' }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#92400e' }}>⚠ Proposed write — confirm before executing</div>
+                      <code style={{ display: 'block', fontSize: 11, fontFamily: 'monospace', background: 'white', border: '1px solid #e5e7eb', borderRadius: 4, padding: '5px 8px', whiteSpace: 'pre-wrap' }}>{msg.pending_write}</code>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button onClick={() => setChatMessages(prev => prev.map(m => m.id === msg.id ? { ...m, pending_write: undefined } : m))} style={{ padding: '4px 12px', background: 'white', border: '1px solid #e5e7eb', borderRadius: 5, fontSize: 11, cursor: 'pointer' }}>Decline</button>
+                        <button onClick={async () => { const sql = msg.pending_write; setChatMessages(prev => prev.map(m => m.id === msg.id ? { ...m, pending_write: undefined } : m)); if (!sql || !activeDb) return; setChatThinking(true); try { const res = await fetch('/api/analyst/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'confirm', workspace_id: workspaceId, connection_id: activeDb.id, confirm_write: true, pending_sql: sql, history: [] }) }).then(r => r.json()); setChatMessages(prev => [...prev, { id: String(Date.now()), role: 'assistant', content: res.reply, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]) } catch {} finally { setChatThinking(false) } }} style={{ padding: '4px 14px', background: '#b45309', color: '#fff', border: 'none', borderRadius: 5, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>Confirm & Execute</button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ fontSize: 10, color: 'var(--text-3)' }}>{msg.time}</div>
+                </div>
+              ))}
+              {chatThinking && <div style={{ display: 'flex', gap: 5, alignItems: 'center', padding: '10px 14px', borderRadius: '12px 12px 12px 4px', background: 'var(--surface-2)', width: 'fit-content', border: '1px solid var(--border-soft)' }}>{[0,200,400].map(d => <span key={d} style={{ width: 5, height: 5, background: 'var(--text-3)', borderRadius: '50%', animation: `bounce 1.2s ${d}ms infinite`, display: 'inline-block' }} />)}</div>}
             </div>
-            <div style={{ flex: 1, padding: 20, position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <canvas id="builder-chart" height={280} />
-              {!chartBuilt && <div style={{ position: 'absolute', fontSize: 13, color: 'var(--text-3)' }}>Configure and build your chart</div>}
+
+            {/* Input */}
+            <div style={{ borderTop: '1px solid var(--border-soft)', padding: '12px 16px', display: 'flex', gap: 8, flexShrink: 0, background: 'var(--surface)', alignItems: 'flex-end' }}>
+              <div style={{ flex: 1 }}>
+                <textarea value={chatInput} onChange={e => setChatInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage() } }} placeholder={activeSource || activeDb ? 'Ask anything — try "show me a bar chart of revenue" or "give me a summary table"...' : 'Load a data source first...'} disabled={!activeSource && !activeDb} rows={2} style={{ width: '100%', resize: 'none', fontSize: 13, border: '1.5px solid var(--border)', borderRadius: 10, padding: '10px 12px', fontFamily: 'inherit', lineHeight: 1.5, background: 'var(--surface)', color: 'var(--text-1)', outline: 'none', boxSizing: 'border-box', opacity: !activeSource && !activeDb ? 0.5 : 1 }} />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <button disabled={!chatInput.trim() || chatThinking || (!activeSource && !activeDb)} onClick={() => sendChatMessage()} style={{ padding: '8px 16px', background: 'linear-gradient(135deg, #4f46e5, #6d28d9)', color: '#fff', border: 'none', borderRadius: 8, cursor: !chatInput.trim() || chatThinking || (!activeSource && !activeDb) ? 'not-allowed' : 'pointer', fontSize: 12, fontWeight: 600, opacity: !chatInput.trim() || chatThinking || (!activeSource && !activeDb) ? 0.4 : 1 }}>Send</button>
+                {chatMessages.length > 0 && <button onClick={clearChat} style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: 'pointer', fontSize: 11, color: 'var(--text-3)' }}>Clear</button>}
+              </div>
             </div>
           </div>
         )}
@@ -560,52 +711,30 @@ export default function AnalystPage() {
                   <button onClick={exportReport} style={{ padding: '5px 12px', background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 6, fontSize: 12, cursor: 'pointer' }}>Export</button>
                   <button onClick={() => setSummaryData(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', fontSize: 11, padding: '2px 6px' }}>Regenerate</button>
                 </div>
-                <div style={{ flex: 1, overflowY: 'auto', padding: 20, fontSize: 13, lineHeight: 1.8, color: 'var(--text-1)' }} dangerouslySetInnerHTML={{ __html: renderMd(summaryData.content) }} />
+                <div style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
+                  <MarkdownRenderer content={summaryData.content} size="md" />
+                </div>
               </div>
             )}
           </div>
         )}
       </main>
 
-      {/* Chat panel (shown when DB active) */}
-      {activeDb && (
-        <aside style={{ borderLeft: '1px solid var(--border)', display: 'flex', flexDirection: 'column', background: 'var(--surface)', overflow: 'hidden' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.07em', color: 'var(--text-2)', borderBottom: '1px solid var(--border-soft)', flexShrink: 0 }}>
-            <span>Chat with data</span>
-            <button onClick={clearChat} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', fontSize: 11, padding: '2px 6px', borderRadius: 4 }}>Clear</button>
-          </div>
-          <div ref={chatEl} style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 14, minHeight: 0 }}>
-            {!chatMessages.length && <p style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.5, textAlign: 'center', margin: 0 }}>Ask follow-up questions or dig deeper into any insight</p>}
-            {chatMessages.map(msg => (
-              <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', gap: 3, alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
-                {msg.user_name && msg.role === 'user' && <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--accent)', marginBottom: 2, paddingLeft: 2 }}>{msg.user_name}</div>}
-                <div style={{ padding: '10px 14px', borderRadius: msg.role === 'user' ? '12px 12px 4px 12px' : '12px 12px 12px 4px', fontSize: 13, lineHeight: 1.68, maxWidth: '90%', background: msg.role === 'user' ? 'linear-gradient(135deg, #4f46e5, #6d28d9)' : 'var(--surface-2)', color: msg.role === 'user' ? '#fff' : 'var(--text-1)', border: msg.role === 'user' ? 'none' : '1px solid var(--border-soft)' }} dangerouslySetInnerHTML={{ __html: renderMd(msg.content) }} />
-                {msg.pending_write && (
-                  <div style={{ background: '#fef3c7', border: '1px solid #fcd34d', borderRadius: 8, padding: '10px 12px', marginTop: 6, display: 'flex', flexDirection: 'column', gap: 7 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: '#92400e' }}>⚠ Proposed write — confirm before executing</div>
-                    <code style={{ display: 'block', fontSize: 11, fontFamily: 'monospace', background: 'white', border: '1px solid #e5e7eb', borderRadius: 4, padding: '5px 8px', whiteSpace: 'pre-wrap' }}>{msg.pending_write}</code>
-                    <div style={{ display: 'flex', gap: 6 }}>
-                      <button onClick={() => setChatMessages(prev => prev.map(m => m.id === msg.id ? { ...m, pending_write: undefined } : m))} style={{ padding: '4px 12px', background: 'white', border: '1px solid #e5e7eb', borderRadius: 5, fontSize: 11, cursor: 'pointer' }}>Decline</button>
-                      <button onClick={async () => { const sql = msg.pending_write; setChatMessages(prev => prev.map(m => m.id === msg.id ? { ...m, pending_write: undefined } : m)); if (!sql || !activeDb) return; setChatThinking(true); try { const res = await fetch('/api/analyst/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'confirm', workspace_id: workspaceId, connection_id: activeDb.id, confirm_write: true, pending_sql: sql, history: [] }) }).then(r => r.json()); setChatMessages(prev => [...prev, { id: String(Date.now()), role: 'assistant', content: res.reply, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]) } catch {} finally { setChatThinking(false) } }} style={{ padding: '5px 14px', background: '#b45309', color: '#fff', border: 'none', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>Confirm & Execute</button>
-                    </div>
-                  </div>
-                )}
-                <div style={{ fontSize: 10, color: 'var(--text-3)' }}>{msg.time}</div>
-              </div>
-            ))}
-            {chatThinking && <div style={{ display: 'flex', gap: 5, alignItems: 'center', padding: '10px 14px', borderRadius: '12px 12px 12px 4px', background: 'var(--surface-2)', width: 'fit-content' }}>{[0,200,400].map(d => <span key={d} style={{ width: 5, height: 5, background: 'var(--text-3)', borderRadius: '50%', animation: `bounce 1.2s ${d}ms infinite`, display: 'inline-block' }} />)}</div>}
-          </div>
-          <div style={{ borderTop: '1px solid var(--border-soft)', padding: '10px 12px', display: 'flex', gap: 8, flexShrink: 0, background: 'var(--surface)', alignItems: 'flex-end' }}>
-            <textarea value={chatInput} onChange={e => setChatInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage() } }} placeholder="Ask anything about your data..." rows={3} style={{ flex: 1, resize: 'none', fontSize: 13, border: '1.5px solid var(--border)', borderRadius: 10, padding: '10px 12px', fontFamily: 'inherit', lineHeight: 1.5, minHeight: 56, background: 'var(--surface)', color: 'var(--text-1)', outline: 'none' }} />
-            <button disabled={!chatInput.trim() || chatThinking} onClick={sendChatMessage} style={{ padding: '8px 16px', background: 'linear-gradient(135deg, #4f46e5, #6d28d9)', color: '#fff', border: 'none', borderRadius: 8, cursor: !chatInput.trim() || chatThinking ? 'not-allowed' : 'pointer', fontSize: 12, fontWeight: 600, opacity: !chatInput.trim() || chatThinking ? 0.4 : 1, alignSelf: 'flex-end' }}>Send</button>
-          </div>
-        </aside>
+      {/* Fullscreen modal */}
+      {fullscreenArtifact && (
+        <FullscreenModal title={fullscreenArtifact.title} onClose={() => setFullscreenArtifact(null)}>
+          {fullscreenArtifact.type === 'table' && (
+            <TableWidget columns={fullscreenArtifact.data.columns} rows={fullscreenArtifact.data.rows} fullscreen />
+          )}
+          {fullscreenArtifact.type === 'graph' && (
+            <GraphWidget chartData={fullscreenArtifact.data} fullscreen />
+          )}
+        </FullscreenModal>
       )}
 
       {/* SQL Error toast */}
       {sqlError && (
         <div style={{ position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 900, display: 'flex', alignItems: 'center', gap: 10, padding: '11px 16px', borderRadius: 10, background: 'rgba(239,68,68,.95)', color: '#fff', fontSize: 13, fontWeight: 500, boxShadow: '0 8px 24px rgba(0,0,0,.25)', border: '1px solid rgba(255,255,255,.15)' }}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
           <span>{sqlError}</span>
           <button onClick={() => setSqlError('')} style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,.7)', cursor: 'pointer', padding: 0, display: 'flex', flexShrink: 0 }}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>

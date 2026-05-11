@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useParams } from 'next/navigation'
+import { swr, cacheInvalidate } from '@/lib/tab-cache'
 import type { Employee, Skill } from '@/types'
 
 // ─── Default personas ─────────────────────────────────────────
@@ -262,15 +263,21 @@ export default function EmployeesPage() {
   const [editingSkill, setEditingSkill]   = useState<Skill | null>(null)
   const [skillSaving, setSkillSaving]     = useState(false)
 
-  const refresh = useCallback(async () => {
-    try {
-      const [emps, sks] = await Promise.all([
-        apiGet<EmployeeWithSkills[]>(`/api/employees?workspaceId=${workspaceId}`),
-        apiGet<Skill[]>(`/api/skills?workspaceId=${workspaceId}`),
-      ])
-      setEmployees(emps); setSkills(sks)
-    } catch (e) { setError(e instanceof Error ? e.message : 'Failed to load') }
-    finally { setLoading(false) }
+  const refresh = useCallback(async (invalidate = false) => {
+    if (invalidate) cacheInvalidate(`employees:${workspaceId}`)
+    await Promise.all([
+      swr(
+        `employees:list:${workspaceId}`,
+        () => apiGet<EmployeeWithSkills[]>(`/api/employees?workspaceId=${workspaceId}`),
+        setEmployees,
+        setLoading,
+      ),
+      swr(
+        `employees:skills:${workspaceId}`,
+        () => apiGet<Skill[]>(`/api/skills?workspaceId=${workspaceId}`),
+        setSkills,
+      ),
+    ])
   }, [workspaceId])
 
   useEffect(() => { refresh() }, [refresh])
@@ -288,7 +295,7 @@ export default function EmployeesPage() {
           await apiMut('/api/employees', 'POST', { workspaceId, name: tpl.name, system_prompt: tpl.system_prompt, skill_ids: all.filter(s => tpl.skill_names.includes(s.name)).map(s => s.id) })
         }
       }
-      await refresh()
+      await refresh(true)
     } catch (e) { setError(e instanceof Error ? e.message : 'Seeding failed') }
     finally { setSeeding(false) }
   }
@@ -298,14 +305,14 @@ export default function EmployeesPage() {
     try {
       if (modal?.mode === 'edit') await apiMut('/api/employees', 'PATCH', { id: modal.employee.id, workspaceId, ...data })
       else await apiMut('/api/employees', 'POST', { workspaceId, ...data })
-      setModal(null); await refresh()
+      setModal(null); await refresh(true)
     } catch (e) { setError(e instanceof Error ? e.message : 'Save failed') }
     finally { setEmpSaving(false) }
   }
 
   async function handleDeleteEmployee(id: string) {
     if (!confirm('Delete this employee?')) return
-    try { await fetch(`/api/employees?id=${id}&workspaceId=${workspaceId}`, { method: 'DELETE' }); await refresh() }
+    try { await fetch(`/api/employees?id=${id}&workspaceId=${workspaceId}`, { method: 'DELETE' }); await refresh(true) }
     catch (e) { setError(e instanceof Error ? e.message : 'Delete failed') }
   }
 
@@ -314,14 +321,14 @@ export default function EmployeesPage() {
     try {
       if (editingSkill) await apiMut('/api/skills', 'PATCH', { id: editingSkill.id, workspaceId, ...data })
       else await apiMut('/api/skills', 'POST', { workspaceId, ...data })
-      setShowSkillForm(false); setEditingSkill(null); await refresh()
+      setShowSkillForm(false); setEditingSkill(null); await refresh(true)
     } catch (e) { setError(e instanceof Error ? e.message : 'Save failed') }
     finally { setSkillSaving(false) }
   }
 
   async function handleDeleteSkill(id: string) {
     if (!confirm('Delete this skill?')) return
-    try { await fetch(`/api/skills?id=${id}&workspaceId=${workspaceId}`, { method: 'DELETE' }); await refresh() }
+    try { await fetch(`/api/skills?id=${id}&workspaceId=${workspaceId}`, { method: 'DELETE' }); await refresh(true) }
     catch (e) { setError(e instanceof Error ? e.message : 'Delete failed') }
   }
 

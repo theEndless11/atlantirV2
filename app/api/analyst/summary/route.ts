@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
-
-const client = new Anthropic()
-const AGENT_MODEL = 'claude-opus-4-5'
+import { useAnthropic, AGENT_MODEL } from '@/lib/anthropic'
 
 export async function POST(req: NextRequest) {
   const body = await req.json()
@@ -13,6 +10,7 @@ export async function POST(req: NextRequest) {
     ? column_stats.map((c: any) => c.type === 'number' ? `${c.name}(${c.min}–${c.max})` : `${c.name}(${c.uniques}unique)`).join(', ')
     : column_stats
 
+  const client = useAnthropic()
   const response = await client.messages.create({
     model: AGENT_MODEL,
     max_tokens: 2000,

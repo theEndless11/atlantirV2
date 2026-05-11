@@ -227,6 +227,79 @@ export interface DataGridArtifact extends ArtifactBase {
   renderer: 'datagrid'
 }
 
+// ─── Table Artifact ──────────
+
+export interface TableArtifact extends ArtifactBase {
+  type: 'table'
+  content: {
+    title?: string
+    columns: string[]
+    rows: Record<string, any>[]
+    sortable?: boolean
+    filterable?: boolean
+  }
+  renderer: 'table'
+}
+
+// ─── Graph Artifact ──────────
+
+export interface GraphArtifact extends ArtifactBase {
+  type: 'graph'
+  content: {
+    chartType: 'bar' | 'line' | 'pie' | 'scatter' | 'doughnut' | 'radar' | 'area'
+    title?: string
+    labels: string[]
+    datasets: Array<{
+      label: string
+      data: number[]
+      color?: string
+    }>
+    options?: Record<string, any>
+  }
+  renderer: 'graph'
+}
+
+// ─── Rich Text Artifact ──────
+
+export interface RichTextArtifact extends ArtifactBase {
+  type: 'richtext'
+  content: {
+    title?: string
+    markdown: string
+    format?: 'markdown' | 'html'
+  }
+  renderer: 'richtext'
+}
+
+// ─── Composite Artifact ──────
+// A single artifact that can mix text, tables, graphs, and code blocks together.
+// Use this when output is a report-style document combining multiple content types.
+
+export interface CompositeBlock {
+  type: 'text' | 'table' | 'graph' | 'code'
+  title?: string
+  content?: string   // for text/code blocks (markdown or source)
+  // table fields
+  columns?: string[]
+  rows?: Record<string, any>[]
+  sortable?: boolean
+  filterable?: boolean
+  // graph fields
+  chartType?: 'bar' | 'line' | 'pie' | 'scatter' | 'doughnut' | 'radar' | 'area'
+  labels?: string[]
+  datasets?: Array<{ label: string; data: number[]; color?: string }>
+}
+
+export interface CompositeArtifact extends ArtifactBase {
+  type: 'composite'
+  content: {
+    title?: string
+    summary?: string
+    blocks: CompositeBlock[]
+  }
+  renderer: 'composite'
+}
+
 // ─── Artifact Union ──────────
 
 export type Artifact =
@@ -237,6 +310,10 @@ export type Artifact =
   | CodeArtifact
   | SlidesArtifact
   | DataGridArtifact
+  | TableArtifact
+  | GraphArtifact
+  | RichTextArtifact
+  | CompositeArtifact
 
 // ─── Approval Request ────────
 

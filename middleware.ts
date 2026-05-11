@@ -6,7 +6,6 @@ const PUBLIC_PATHS = ['/login', '/register', '/onboarding', '/join', '/auth', '/
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl
 
-  // Allow public paths and static files
   if (
     PUBLIC_PATHS.some(p => pathname.startsWith(p)) ||
     pathname.startsWith('/_next') ||
@@ -33,9 +32,10 @@ export async function middleware(request: NextRequest) {
     }
   )
 
-  const { data: { session } } = await supabase.auth.getSession()
+  // getUser() validates the JWT locally from the cookie — no network round-trip to Supabase
+  const { data: { user } } = await supabase.auth.getUser()
 
-  if (!session) {
+  if (!user) {
     const loginUrl = new URL('/login', request.url)
     loginUrl.searchParams.set('next', pathname)
     return NextResponse.redirect(loginUrl)

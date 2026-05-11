@@ -1,13 +1,8 @@
 'use client'
 
-/**
- * Memory tab UI — /workspace/[id]/memory
- * FIXED: Removed duplicate parallel fetch (was calling /api/memory twice on mount).
- * Now uses a single fetch for the file list.
- */
-
 import { useState, useEffect, useCallback } from 'react'
 import { useParams } from 'next/navigation'
+import { swr, cacheInvalidate } from '@/lib/tab-cache'
 
 interface MemoryFileMeta {
   id: string
@@ -119,20 +114,20 @@ export default function MemoryPage() {
   const [newFilePath, setNewFilePath] = useState('')
   const [showNewFile, setShowNewFile] = useState(false)
 
-  // Single fetch — no duplicate parallel call
-  const loadTree = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/memory?workspaceId=${workspaceId}`)
-      if (!res.ok) throw new Error('Failed to load memory files')
-      const json = await res.json()
-      if (Array.isArray(json.files)) {
-        setFiles(json.files)
-      }
-    } catch {
-      setError('Could not load memory files')
-    } finally {
-      setLoading(false)
-    }
+  // SWR: show cached file list instantly, revalidate in background
+  const loadTree = useCallback(async (invalidate = false) => {
+    if (invalidate) cacheInvalidate(`memory:tree:${workspaceId}`)
+    await swr(
+      `memory:tree:${workspaceId}`,
+      async () => {
+        const res = await fetch(`/api/memory?workspaceId=${workspaceId}`)
+        if (!res.ok) throw new Error('Failed to load memory files')
+        const json = await res.json()
+        return Array.isArray(json.files) ? json.files : []
+      },
+      setFiles,
+      setLoading,
+    ).catch(() => setError('Could not load memory files'))
   }, [workspaceId])
 
   useEffect(() => { loadTree() }, [loadTree])
@@ -171,7 +166,7 @@ export default function MemoryPage() {
       const json = await res.json()
       if (!res.ok || !json.ok) throw new Error(json.error || 'Save failed')
       setSavedContent(editorContent)
-      loadTree()
+      loadTree(true)
     } catch (err: any) {
       setSaveError(err.message)
     } finally {
@@ -192,7 +187,7 @@ export default function MemoryPage() {
       const json = await res.json()
       if (!res.ok || !json.ok) throw new Error(json.error || 'Create failed')
       setShowNewFile(false); setNewFilePath('')
-      await loadTree()
+      await loadTree(true)
       setSelectedPath(path)
       setEditorContent(`# ${path}\n\n`)
       setSavedContent(`# ${path}\n\n`)
@@ -215,7 +210,7 @@ export default function MemoryPage() {
       const json = await res.json()
       if (!res.ok || !json.ok) throw new Error(json.error || 'Delete failed')
       setSelectedPath(null); setEditorContent(''); setSavedContent('')
-      loadTree()
+      loadTree(true)
     } catch (err: any) {
       setSaveError(err.message)
     }

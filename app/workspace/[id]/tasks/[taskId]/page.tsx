@@ -87,12 +87,12 @@ function MessageThread({ messages }: { messages: Message[] }) {
 // Page
 // ---------------------------------------------------------------------------
 
-export default function TaskDetailPage({
+export default async function TaskDetailPage({
   params,
 }: {
-  params: { id: string; taskId: string }
+  params: Promise<{ id: string; taskId: string }>
 }) {
-  const { id: workspaceId, taskId } = params
+  const { id: workspaceId, taskId } = await params
 
   const [data, setData] = useState<TaskPageData | null>(null)
   const [error, setError] = useState<string | null>(null)

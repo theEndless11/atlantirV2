@@ -3,6 +3,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { useParams } from 'next/navigation'
 import { supabaseBrowser } from '@/lib/supabase-browser'
+import { swr, cacheInvalidate } from '@/lib/tab-cache'
 
 const AVATAR_COLORS = ['#6366f1','#8b5cf6','#ec4899','#f59e0b','#10b981','#3b82f6','#ef4444']
 
@@ -43,26 +44,35 @@ export default function SettingsPage() {
     [members, userId]
   )
 
-  async function loadData() {
+  async function loadData(invalidate = false) {
+    if (invalidate) cacheInvalidate(`settings:${workspaceId}`)
     setLoading(true)
+
+    // Get userId from already-cached session — no network round-trip
     const sb = supabaseBrowser()
     const { data: { session } } = await sb.auth.getSession()
     setUserId(session?.user.id)
 
-    const { data: ws } = await sb
-      .from('workspaces')
-      .select('name, invite_token, invite_enabled')
-      .eq('id', workspaceId).single()
+    await Promise.all([
+      swr(
+        `settings:ws:${workspaceId}`,
+        () => sb.from('workspaces').select('name, invite_token, invite_enabled').eq('id', workspaceId).single().then(r => r.data),
+        (ws) => {
+          if (ws) {
+            setWorkspaceName(ws.name)
+            setInviteToken(ws.invite_token || '')
+            setInviteEnabled(ws.invite_enabled ?? true)
+            if (!ws.invite_token) regenLink(true)
+          }
+        },
+      ),
+      swr(
+        `settings:members:${workspaceId}`,
+        () => fetch(`/api/workspace/members?workspace_id=${workspaceId}`).then(r => r.ok ? r.json() : []),
+        setMembers,
+      ),
+    ])
 
-    if (ws) {
-      setWorkspaceName(ws.name)
-      setInviteToken(ws.invite_token || '')
-      setInviteEnabled(ws.invite_enabled ?? true)
-      if (!ws.invite_token) await regenLink(true)
-    }
-
-    const res = await fetch(`/api/workspace/members?workspace_id=${workspaceId}`)
-    if (res.ok) setMembers(await res.json())
     setLoading(false)
   }
 
@@ -108,7 +118,7 @@ export default function SettingsPage() {
     if (res.ok) {
       setInviteResult(data.message)
       setInviteEmail('')
-      await loadData()
+      await loadData(true)
     } else {
       setInviteResult(data.message || 'Failed to invite')
       setInviteError(true)

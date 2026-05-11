@@ -4,6 +4,7 @@ import Nango from '@nangohq/frontend'
 
 import { useState, useEffect, useCallback } from 'react'
 import { useParams } from 'next/navigation'
+import { swr, cacheSet, cacheGet, cacheInvalidate } from '@/lib/tab-cache'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -318,24 +319,22 @@ export default function IntegrationsPage() {
 
   // Load employees
   useEffect(() => {
-    fetch(`/api/employees?workspaceId=${workspaceId}`)
-      .then(r => r.ok ? r.json() : [])
-      .then((data: Employee[]) => {
-        setEmployees(data)
-        if (data.length > 0) setSelectedEmployeeId(data[0].id)
-      })
-      .catch(() => {})
-  }, [workspaceId])
+    const empKey = `integrations:employees:${workspaceId}`
+    const intKey = `integrations:data:${workspaceId}`
 
-  // Load API key statuses + configs AND persisted OAuth statuses from Supabase
-  useEffect(() => {
-    fetch(`/api/integrations?workspace_id=${workspaceId}`)
-      .then(r => r.ok ? r.json() : [])
-      .then((data: { type: string; status: string; config: Record<string, string>; employee_id?: string }[]) => {
+    swr(
+      empKey,
+      () => fetch(`/api/employees?workspaceId=${workspaceId}`).then(r => r.ok ? r.json() : []),
+      (data: Employee[]) => { setEmployees(data); if (data.length > 0) setSelectedEmployeeId(data[0].id) },
+    )
+
+    swr(
+      intKey,
+      () => fetch(`/api/integrations?workspace_id=${workspaceId}`).then(r => r.ok ? r.json() : []),
+      (data: { type: string; status: string; config: Record<string, string>; employee_id?: string }[]) => {
         const apikeyStatusMap: Record<string, ConnectionStatus> = {}
         const configs: Record<string, Record<string, string>> = {}
-        const oauthStatusMap: Record<string, Record<string, ConnectionStatus>> = {} // employeeId -> appKey -> status
-
+        const oauthStatusMap: Record<string, Record<string, ConnectionStatus>> = {}
         for (const row of data) {
           const appKey = row.type
           if (INTEGRATIONS[appKey]?.authType === 'apikey') {
@@ -348,43 +347,61 @@ export default function IntegrationsPage() {
         }
         setApikeyStatuses(apikeyStatusMap)
         setSavedConfigs(configs)
-        // Seed OAuth statuses from Supabase so they survive refresh immediately
         setPersistedOauthStatuses(oauthStatusMap)
-      })
-      .catch(() => {})
+      },
+    )
   }, [workspaceId])
 
-  // Fetch OAuth statuses for selected employee — verifies live status with Nango
+  // Fetch OAuth statuses for selected employee via single batch call
   const fetchOauthStatuses = useCallback(async (employeeId: string) => {
     if (!employeeId) return
     const entityId = `ws:${workspaceId}:emp:${employeeId}`
     const oauthKeys = Object.keys(INTEGRATIONS).filter(k => INTEGRATIONS[k].authType === 'oauth')
+    const cacheKey = `integrations:oauth:${workspaceId}:${employeeId}`
 
-    // Show loading only for keys not already known from Supabase
+    const cached = cacheGet<Record<string, ConnectionStatus>>(cacheKey)
+    if (cached) {
+      setOauthStatuses(cached)
+      // Revalidate silently in background
+      fetch('/api/integrations/status-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entityId, apps: oauthKeys }),
+      })
+        .then(r => r.json())
+        .then(({ statuses }) => {
+          const next: Record<string, ConnectionStatus> = {}
+          for (const k of oauthKeys) next[k] = (statuses[k] ?? 'none') as ConnectionStatus
+          cacheSet(cacheKey, next)
+          setOauthStatuses(next)
+        })
+        .catch(() => {})
+      return
+    }
+
+    // No cache — show loading state only for unknown keys, then batch fetch
     setOauthStatuses(prev => {
       const next = { ...prev }
-      for (const k of oauthKeys) {
-        if (!next[k] || next[k] === 'none') next[k] = 'loading'
-      }
+      for (const k of oauthKeys) { if (!next[k] || next[k] === 'none') next[k] = 'loading' }
       return next
     })
 
-    const results = await Promise.allSettled(
-      oauthKeys.map(async (appKey) => {
-        const res = await fetch(`/api/integrations/status?entityId=${encodeURIComponent(entityId)}&app=${appKey}`)
-        const data = res.ok ? await res.json() : { status: 'none' }
-        return [appKey, (data.status ?? 'none') as ConnectionStatus] as const
+    try {
+      const res = await fetch('/api/integrations/status-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entityId, apps: oauthKeys }),
       })
-    )
-
-    const next: Record<string, ConnectionStatus> = {}
-    for (const r of results) {
-      if (r.status === 'fulfilled') next[r.value[0]] = r.value[1]
+      const { statuses } = await res.json()
+      const next: Record<string, ConnectionStatus> = {}
+      for (const k of oauthKeys) next[k] = (statuses[k] ?? 'none') as ConnectionStatus
+      cacheSet(cacheKey, next)
+      setOauthStatuses(next)
+    } catch {
+      const next: Record<string, ConnectionStatus> = {}
+      for (const k of oauthKeys) next[k] = 'none'
+      setOauthStatuses(next)
     }
-    for (const k of oauthKeys) {
-      if (!next[k]) next[k] = 'none'
-    }
-    setOauthStatuses(next)
   }, [workspaceId])
 
   useEffect(() => {

@@ -276,13 +276,3 @@ function DataGridRenderer(_a) {
         aiError && (React.createElement("p", { style: { fontSize: 12, color: 'var(--red-text)', padding: '0 4px' } }, aiError))));
 }
 exports.DataGridRenderer = DataGridRenderer;
-git;
-add.
-;
-git;
-commit - m;
-"...";
-git;
-push;
-origin;
-main;

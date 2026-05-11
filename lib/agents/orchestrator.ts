@@ -1,5 +1,5 @@
-import { useAnthropic, ORCHESTRATOR_MODEL, MAX_TOKENS } from '../utils/anthropic'
-import { useSupabaseAdmin } from '../utils/supabase'
+import { callLLM, ORCHESTRATOR_MODEL, MAX_TOKENS } from '../anthropic'
+import { supabaseAdmin } from '../supabase'
 import type { CreateTaskPayload, OrchestratorResult } from '@/types'
 
 async function getWorkspaceTools(workspaceId: string): Promise<string> {
@@ -60,22 +60,15 @@ export async function runOrchestrator(
   workspaceId: string,
   meetingId?: string
 ): Promise<OrchestratorResult> {
-  const client = useAnthropic()
   const tools = await getWorkspaceTools(workspaceId)
   const systemPrompt = BASE_SYSTEM_PROMPT + (tools ? `\n\nWorkspace tools available:${tools}` : '')
 
-  const response = await client.messages.create({
+  const raw = (await callLLM({
     model: ORCHESTRATOR_MODEL,
-    max_tokens: MAX_TOKENS,
     system: systemPrompt,
-    messages: [{ role: 'user', content: input }]
-  })
-
-  const raw = response.content
-    .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text)
-    .join('').trim()
-    .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim()
+    prompt: input,
+    maxTokens: MAX_TOKENS,
+  })).trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim()
 
   let parsed: any
   try {

@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createServerClient } from '@supabase/ssr'
+import { createServerClient, type CookieOptions } from '@supabase/ssr'
 
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url)
+
   const code = searchParams.get('code')
   const next = searchParams.get('next') ?? '/'
 
@@ -17,15 +18,28 @@ export async function GET(request: NextRequest) {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
       cookies: {
-        getAll() { return request.cookies.getAll() },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) => response.cookies.set(name, value, options))
+        getAll() {
+          return request.cookies.getAll()
+        },
+
+        setAll(
+          cookiesToSet: {
+            name: string
+            value: string
+            options: CookieOptions
+          }[]
+        ) {
+          cookiesToSet.forEach(({ name, value, options }) => {
+            response.cookies.set(name, value, options)
+          })
         }
       }
     }
   )
 
-  const { data, error } = await supabase.auth.exchangeCodeForSession(code)
+  const { data, error } =
+    await supabase.auth.exchangeCodeForSession(code)
+
   if (error || !data.session) {
     return NextResponse.redirect(`${origin}/login?error=auth_failed`)
   }
@@ -33,7 +47,7 @@ export async function GET(request: NextRequest) {
   const user = data.session.user
   const meta = user.user_metadata
 
-  // Upsert user profile (mirrors the Nuxt callback)
+  // Upsert user profile
   await supabase.from('users').upsert({
     id: user.id,
     email: user.email,
@@ -41,7 +55,7 @@ export async function GET(request: NextRequest) {
     avatar_url: meta?.avatar_url || null,
   })
 
-  // If user was invited to a workspace via metadata (email invite flow)
+  // Handle workspace invite flow
   if (meta?.invited_to_workspace) {
     const { data: existing } = await supabase
       .from('workspace_members')
@@ -54,14 +68,16 @@ export async function GET(request: NextRequest) {
       await supabase.from('workspace_members').insert({
         workspace_id: meta.invited_to_workspace,
         user_id: user.id,
-        role: meta.invited_role || 'member'
+        role: meta.invited_role || 'member',
       })
     }
 
-    return NextResponse.redirect(`${origin}/workspace/${meta.invited_to_workspace}`)
+    return NextResponse.redirect(
+      `${origin}/workspace/${meta.invited_to_workspace}`
+    )
   }
 
-  // Normal flow: find existing workspace or go to onboarding
+  // Normal flow
   const { data: ws } = await supabase
     .from('workspace_members')
     .select('workspace_id')
@@ -71,7 +87,9 @@ export async function GET(request: NextRequest) {
     .single()
 
   if (ws) {
-    return NextResponse.redirect(`${origin}/workspace/${ws.workspace_id}`)
+    return NextResponse.redirect(
+      `${origin}/workspace/${ws.workspace_id}`
+    )
   }
 
   return NextResponse.redirect(`${origin}/onboarding`)

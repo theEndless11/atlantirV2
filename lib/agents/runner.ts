@@ -1,5 +1,6 @@
-import { useAnthropic, AGENT_MODEL, MAX_TOKENS } from '../utils/anthropic'
-import { useSupabaseAdmin } from '../utils/supabase'
+import { callLLM, AGENT_MODEL, MAX_TOKENS, getLLM } from '../anthropic'
+import { supabaseAdmin } from '../supabase'
+import { streamText } from 'ai'
 import type { AgentType, Task } from '@/types'
 
 const AGENT_PROMPTS: Record<AgentType, string> = {
@@ -7,22 +8,26 @@ const AGENT_PROMPTS: Record<AgentType, string> = {
   research: `You are a Research Agent. Find accurate, up-to-date information on the given topic.
 - Summarise findings clearly with source context where available
 - If company knowledge is provided, prioritise it over general knowledge
+- You can produce: richtext documents (markdown), tables of data, or graphs/charts when relevant
 - Return a well-structured research summary`,
   writer: `You are a Writer Agent. Produce clear, professional written content.
 - Match tone to context (formal for reports, conversational for emails)
 - Structure content with headers where appropriate
 - If company knowledge is provided, use it to personalise the content
+- You can produce: richtext documents, tables (for structured comparisons), or graphs (for data visualisation)
 - Return the complete document, ready to use`,
   analyst: `You are an Analyst Agent. Analyse information and produce insights.
 - Use structured frameworks (pros/cons, comparisons, rankings)
 - Back conclusions with reasoning
 - If company knowledge is provided, incorporate it into the analysis
 - If connected databases are listed, reference them in your analysis — the executor can query them if needed
+- You can produce: tables (for data comparisons), graphs (bar, line, pie, scatter, area), or richtext reports
 - Return a clear analysis with actionable recommendations`,
   executor: `You are an Executor Agent. Carry out specific tasks precisely using the connected tools and integrations available.
 - Do exactly what is asked
 - Use the connected integrations and databases listed in the workspace context
 - IMPORTANT: If databases are listed as connected, you have access to them — do not claim otherwise
+- When the task involves data, produce a table or graph artifact to visualise results
 - Report what you did and the result clearly
 - Return a clear completion report`
 }
@@ -93,24 +98,18 @@ async function getTaskMessages(taskId: string) {
 }
 
 export async function checkNeedsClarification(task: Task, agentType: AgentType): Promise<string | null> {
-  const client = useAnthropic()
-  const response = await client.messages.create({
+  const text = await callLLM({
     model: AGENT_MODEL,
-    max_tokens: 300,
     system: CLARIFICATION_PROMPT,
-    messages: [{ role: 'user', content: `Task: ${task.title}\n\n${task.description || ''}` }]
+    prompt: `Task: ${task.title}\n\n${task.description || ''}`,
+    maxTokens: 300,
   })
-  const text = response.content
-    .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text)
-    .join('').trim()
-  if (text === 'PROCEED') return null
-  return text
+  if (text.trim() === 'PROCEED') return null
+  return text.trim()
 }
 
 export async function runAgent(task: Task, agentType: AgentType, runId: string): Promise<string> {
   const sb = supabaseAdmin()
-  const client = useAnthropic()
 
   const [context, toolsContext, history] = await Promise.all([
     getRelevantContext(`${task.title} ${task.description || ''}`, task.workspace_id),
@@ -121,33 +120,53 @@ export async function runAgent(task: Task, agentType: AgentType, runId: string):
   const agentBasePrompt = AGENT_PROMPTS[agentType]
   const systemPrompt = agentBasePrompt + (toolsContext ? `\n\nWorkspace tools context:${toolsContext}` : '')
 
-  const messages: any[] = []
-
+  let prompt = ''
   if (context) {
-    messages.push({ role: 'user', content: `Relevant company knowledge for this task:\n\n${context}` })
-    messages.push({ role: 'assistant', content: 'Understood, I have reviewed the company knowledge and will use it in my response.' })
+    prompt += `Relevant company knowledge for this task:\n\n${context}\n\n---\n\n`
   }
-
   for (const msg of history) {
-    messages.push({
-      role: msg.sender_type === 'human' ? 'user' : 'assistant',
-      content: msg.content
-    })
+    prompt += `${msg.sender_type === 'human' ? 'User' : 'Assistant'}: ${msg.content}\n\n`
   }
+  prompt += `Task: ${task.title}\n\n${task.description || ''}`
 
-  messages.push({ role: 'user', content: `Task: ${task.title}\n\n${task.description || ''}` })
-
-  const response = await client.messages.create({
-    model: AGENT_MODEL,
-    max_tokens: MAX_TOKENS,
-    system: systemPrompt,
-    messages
+  // Emit "started" update
+  await sb.from('task_updates').insert({
+    workspace_id: task.workspace_id,
+    task_id: task.id,
+    agent_run_id: runId,
+    pet_name: agentType,
+    update_type: 'started',
+    content: `${agentType} agent starting…`,
   })
 
-  const output = response.content
-    .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text)
-    .join('\n')
+  // Stream the response and emit chunks as progress updates
+  let accumulated = ''
+  let lastEmitLen = 0
+  const EMIT_EVERY = 150
+
+  const { textStream } = streamText({
+    model: getLLM(AGENT_MODEL),
+    system: systemPrompt,
+    prompt,
+    maxTokens: MAX_TOKENS,
+  })
+
+  for await (const delta of textStream) {
+    accumulated += delta
+    if (accumulated.length - lastEmitLen >= EMIT_EVERY) {
+      lastEmitLen = accumulated.length
+      await sb.from('task_updates').insert({
+        workspace_id: task.workspace_id,
+        task_id: task.id,
+        agent_run_id: runId,
+        pet_name: agentType,
+        update_type: 'progress',
+        content: accumulated,
+      })
+    }
+  }
+
+  const output = accumulated
 
   await sb.from('agent_runs').update({
     status: 'completed',

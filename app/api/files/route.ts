@@ -10,8 +10,9 @@ async function extractText(buffer: Buffer, mimeType: string, filename: string): 
     const client = useAnthropic()
     const base64 = buffer.toString('base64')
     const response = await client.messages.create({
-      model: AGENT_MODEL, max_tokens: 4096,
-      messages: [{ role: 'user', content: [
+  model: AGENT_MODEL, max_tokens: 4096,
+  system: '',
+  messages: [{ role: 'user', content: [
         { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } } as any,
         { type: 'text', text: 'Extract all text content from this document. Return only the raw text, preserve structure.' }
       ]}]

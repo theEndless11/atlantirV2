@@ -64,6 +64,32 @@ export const VideoContentSchema = z.object({
   compositionId: z.string(),
 })
 
+export const TableContentSchema = z.object({
+  title: z.string().optional(),
+  columns: z.array(z.string()),
+  rows: z.array(z.record(z.any())),
+  sortable: z.boolean().optional(),
+  filterable: z.boolean().optional(),
+})
+
+export const GraphContentSchema = z.object({
+  chartType: z.enum(['bar', 'line', 'pie', 'scatter', 'doughnut', 'radar', 'area']),
+  title: z.string().optional(),
+  labels: z.array(z.string()),
+  datasets: z.array(z.object({
+    label: z.string(),
+    data: z.array(z.number()),
+    color: z.string().optional(),
+  })),
+  options: z.record(z.any()).optional(),
+})
+
+export const RichTextContentSchema = z.object({
+  title: z.string().optional(),
+  markdown: z.string(),
+  format: z.enum(['markdown', 'html']).optional(),
+})
+
 // ---------------------------------------------------------------------------
 // Artifact type → renderer mapping
 // ---------------------------------------------------------------------------
@@ -75,6 +101,11 @@ export const ARTIFACT_RENDERERS: Record<Artifact['type'], string> = {
   chart: 'tremor',
   code: 'e2b',
   slides: 'spectacle',
+  datagrid: 'datagrid',
+  table: 'table',
+  graph: 'graph',
+  richtext: 'richtext',
+  composite: 'composite',
 }
 
 // ---------------------------------------------------------------------------
@@ -303,4 +334,116 @@ export async function getArtifact(artifactId: string): Promise<Artifact | null> 
   const sb = supabaseAdmin()
   const { data } = await sb.from('artifacts').select('*').eq('id', artifactId).single()
   return data as Artifact | null
+}
+
+// ---------------------------------------------------------------------------
+// Generate a table artifact
+// ---------------------------------------------------------------------------
+
+export async function generateTableArtifact(opts: {
+  workspaceId: string
+  taskId?: string
+  employeeId: string
+  title: string
+  prompt: string
+  systemPrompt: string
+}): Promise<Artifact> {
+  const { object } = await generateObject({
+    model: llm(),
+    system: opts.systemPrompt,
+    prompt: opts.prompt,
+    schema: TableContentSchema,
+    experimental_telemetry: buildTelemetry({
+      functionId: 'artifact-generate-table',
+      workspaceId: opts.workspaceId,
+      employeeId: opts.employeeId,
+      taskId: opts.taskId,
+    }),
+  })
+
+  return createArtifact({
+    workspaceId: opts.workspaceId,
+    taskId: opts.taskId,
+    employeeId: opts.employeeId,
+    type: 'table',
+    title: opts.title,
+    content: object as Record<string, unknown>,
+    createdBy: `agent:${opts.employeeId}`,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Generate a graph artifact
+// ---------------------------------------------------------------------------
+
+export async function generateGraphArtifact(opts: {
+  workspaceId: string
+  taskId?: string
+  employeeId: string
+  title: string
+  prompt: string
+  systemPrompt: string
+}): Promise<Artifact> {
+  const { object } = await generateObject({
+    model: llm(),
+    system: opts.systemPrompt,
+    prompt: opts.prompt,
+    schema: GraphContentSchema,
+    experimental_telemetry: buildTelemetry({
+      functionId: 'artifact-generate-graph',
+      workspaceId: opts.workspaceId,
+      employeeId: opts.employeeId,
+      taskId: opts.taskId,
+    }),
+  })
+
+  return createArtifact({
+    workspaceId: opts.workspaceId,
+    taskId: opts.taskId,
+    employeeId: opts.employeeId,
+    type: 'graph',
+    title: opts.title,
+    content: object as Record<string, unknown>,
+    createdBy: `agent:${opts.employeeId}`,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Generate a richtext artifact
+// ---------------------------------------------------------------------------
+
+export async function generateRichTextArtifact(opts: {
+  workspaceId: string
+  taskId?: string
+  employeeId: string
+  title: string
+  prompt: string
+  systemPrompt: string
+}): Promise<{ artifact: Artifact; stream: ReturnType<typeof streamObject> }> {
+  const stream = streamObject({
+    model: llm(),
+    system: opts.systemPrompt,
+    prompt: opts.prompt,
+    schema: RichTextContentSchema,
+    experimental_telemetry: buildTelemetry({
+      functionId: 'artifact-generate-richtext',
+      workspaceId: opts.workspaceId,
+      employeeId: opts.employeeId,
+      taskId: opts.taskId,
+    }),
+  })
+
+  const fullObject = await stream.object
+
+  const artifact = await createArtifact({
+    workspaceId: opts.workspaceId,
+    taskId: opts.taskId,
+    employeeId: opts.employeeId,
+    type: 'richtext',
+    title: opts.title,
+    content: fullObject as Record<string, unknown>,
+    createdBy: `agent:${opts.employeeId}`,
+  })
+
+  return { artifact, stream }
 }

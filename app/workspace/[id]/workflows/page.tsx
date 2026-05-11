@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { useParams } from 'next/navigation'
+import { swr, cacheInvalidate } from '@/lib/tab-cache'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface WorkflowStep {
@@ -163,15 +164,20 @@ export default function WorkflowsPage() {
   const [toast, setToast] = useState('')
 
   useEffect(() => {
-    load()
+    swr(
+      `workflows:${workspaceId}`,
+      () => fetch(`/api/workflows?workspace_id=${workspaceId}`).then(r => r.json()).then(d => d || []),
+      setWorkflows,
+    )
   }, [workspaceId])
 
-  async function load() {
-    try {
-      const res = await fetch(`/api/workflows?workspace_id=${workspaceId}`)
-      const data: Workflow[] = await res.json()
-      setWorkflows(data || [])
-    } catch {}
+  async function load(invalidate = false) {
+    if (invalidate) cacheInvalidate(`workflows:${workspaceId}`)
+    await swr(
+      `workflows:${workspaceId}`,
+      () => fetch(`/api/workflows?workspace_id=${workspaceId}`).then(r => r.json()).then(d => d || []),
+      setWorkflows,
+    )
   }
 
   function showToast(msg: string) {

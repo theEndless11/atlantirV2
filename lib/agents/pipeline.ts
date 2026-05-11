@@ -1,23 +1,19 @@
 /**
  * Agent pipeline — runs a sequence of specialized agents (pets) to complete a task.
  *
- * Key upgrade: Bolt (executor) now uses Anthropic's native tool_use API instead of
- * parsing ACTION: text lines. This is more reliable, handles multi-step tool chaining,
- * and gives agents proper structured access to all 20+ connected integrations.
- *
- * Architecture inspired by:
- *  - Composio: structured tool definitions per integration
- *  - ACI.dev: only connected tools are passed to the agent (no context bloat)
- *  - Nango: per-workspace credential management via integrations table
+ * Uses @ai-sdk/openai → OpenRouter for all LLM calls (fixes 401 errors that
+ * occurred when the Anthropic SDK was incorrectly pointed at OpenRouter).
  */
 
-import { useAnthropic, AGENT_MODEL, EXECUTOR_MODEL, MAX_TOKENS } from '../utils/anthropic'
-import { useSupabaseAdmin } from '../utils/supabase'
+import { getLLM, callLLM, AGENT_MODEL, EXECUTOR_MODEL, MAX_TOKENS } from '../anthropic'
+import { generateText, streamText, tool } from 'ai'
+import { z } from 'zod'
+import { supabaseAdmin } from '../supabase'
 import { PETS, getPipelineForTask } from './pets'
 import type { PetName } from './pets'
 import type { Task } from '@/types'
-import { getConnectedTools, toAnthropicTool } from '../utils/tool-registry'
-import { executeTools, type ToolCall } from '../utils/tool-executor'
+import { executeTools, type ToolCall } from '../tool-executor'
+import { getConnectedTools, toAnthropicTool } from '../tool-registry'
 
 // ─── Context loaders ──────────────────────────────────────────────────────────
 
@@ -46,7 +42,7 @@ async function getIntegrationSummary(workspaceId: string): Promise<string> {
   const hasAnything = (data?.length || 0) + (dbData?.length || 0) > 0
   if (!hasAnything) return ''
 
-  const lines = data.map(i => {
+  const lines = (data || []).map(i => {
     const cfg = i.config as any
     const details: Record<string, string> = {
       slack:           `Slack (default channel: ${cfg?.channel || '#general'})`,
@@ -74,17 +70,15 @@ async function getIntegrationSummary(workspaceId: string): Promise<string> {
   })
 
   let summary = ''
-  if (lines.length) {
-    summary += `\n\n## Connected integrations\n${lines.join('\n')}`
-  }
-  summary += `\n\nAlways available (no connection needed):\n- Excel: generate .xlsx files\n- Web search: search the internet`
+  if (lines.length) summary += `\n\n## Connected integrations\n${lines.join('\n')}`
+  summary += `\n\nAlways available:\n- Excel: generate .xlsx files\n- Web search: search the internet`
 
   if (dbData?.length) {
     const dbLines = dbData.map((d: any) => {
       const tables = d.config?.tables?.length ? ` (tables: ${d.config.tables.join(', ')})` : ''
       return `- ${d.name} [${d.db_type}] — status: ${d.status}${tables}`
     })
-    summary += `\n\n## Connected databases (you CAN query these — they are available)\n${dbLines.join('\n')}`
+    summary += `\n\n## Connected databases\n${dbLines.join('\n')}`
   }
 
   return summary
@@ -101,16 +95,18 @@ async function loadMemory(workspaceId: string, agentType: string): Promise<strin
 
 async function saveMemory(workspaceId: string, agentType: string, content: string, taskId: string) {
   try {
-    const client = useAnthropic()
-    const res = await client.messages.create({
-      model: AGENT_MODEL, max_tokens: 150,
+    const memory = await callLLM({
+      model: AGENT_MODEL,
       system: 'Extract 1 key fact worth remembering for future tasks. Return just the fact as one sentence, or "NONE".',
-      messages: [{ role: 'user', content: content.slice(0, 800) }]
+      prompt: content.slice(0, 800),
+      maxTokens: 150,
     })
-    const memory = res.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('').trim()
     if (memory && memory !== 'NONE') {
       const sb = supabaseAdmin()
-      await sb.from('agent_memory').insert({ workspace_id: workspaceId, agent_type: agentType, memory_type: 'fact', content: memory, source_task_id: taskId })
+      await sb.from('agent_memory').insert({
+        workspace_id: workspaceId, agent_type: agentType,
+        memory_type: 'fact', content: memory, source_task_id: taskId
+      })
     }
   } catch {}
 }
@@ -120,9 +116,53 @@ async function postProgress(taskId: string, workspaceId: string, petName: string
   await sb.from('task_updates').insert({ task_id: taskId, workspace_id: workspaceId, agent_type: agentType, pet_name: petName, update_type: type, content })
 }
 
-// ─── Agentic tool loop (for Bolt) ─────────────────────────────────────────────
-// Runs an agentic loop: LLM calls tools → we execute them → LLM sees results → repeat
-// until LLM produces a final text response. Max 10 rounds to prevent runaway loops.
+// ─── Build AI SDK tools from tool-registry ───────────────────────────────────
+// Maps each connected tool into AI SDK `tool()` format.
+// The actual execution still goes through executeTools() so all the
+// existing integration dispatch logic is preserved.
+
+async function buildAiSdkTools(workspaceId: string): Promise<Record<string, any>> {
+  const connected = await getConnectedTools(workspaceId)
+  if (!connected.length) return {}
+
+  const tools: Record<string, any> = {}
+
+  for (const t of connected) {
+    // Build a Zod schema from the tool's input_schema properties
+    const props = t.input_schema?.properties || {}
+    const required: string[] = t.input_schema?.required || []
+    const shape: Record<string, any> = {}
+
+    for (const [key, def] of Object.entries(props as Record<string, any>)) {
+      let zField = z.string().describe(def.description || key)
+      if (!required.includes(key)) zField = zField.optional() as any
+      shape[key] = zField
+    }
+
+    const toolName = t.name
+    const wid = workspaceId
+
+    tools[toolName] = tool({
+      description: t.description,
+      parameters: z.object(shape),
+      execute: async (input: Record<string, any>) => {
+        const calls: ToolCall[] = [{
+          id: `${toolName}-${Date.now()}`,
+          name: toolName,
+          input: Object.fromEntries(
+            Object.entries(input).map(([k, v]) => [k, String(v ?? '')])
+          ),
+        }]
+        const results = await executeTools(calls, wid)
+        return results[0]?.content || 'Tool completed'
+      },
+    })
+  }
+
+  return tools
+}
+
+// ─── Agentic tool loop (for Bolt/executor) ────────────────────────────────────
 
 async function runAgenticLoop(
   systemPrompt: string,
@@ -130,85 +170,35 @@ async function runAgenticLoop(
   workspaceId: string,
   onProgress: (msg: string) => Promise<void>
 ): Promise<string> {
-  const client = useAnthropic()
-  const tools = await getConnectedTools(workspaceId)
-  const anthropicTools = tools.map(toAnthropicTool)
+  const tools = await buildAiSdkTools(workspaceId)
+  const hasTools = Object.keys(tools).length > 0
 
-  const messages: any[] = [{ role: 'user', content: userMessage }]
-  let roundsLeft = 10
-  const allToolResults: string[] = []
-
-  while (roundsLeft-- > 0) {
-    const response = await client.messages.create({
-      model: EXECUTOR_MODEL,
-      max_tokens: MAX_TOKENS,
+  try {
+    const result = await generateText({
+      model: getLLM(EXECUTOR_MODEL),
       system: systemPrompt,
-      tools: anthropicTools.length > 0 ? anthropicTools : undefined,
-      tool_choice: anthropicTools.length > 0 ? { type: 'auto' } : undefined,
-      messages,
+      prompt: userMessage,
+      tools: hasTools ? tools : undefined,
+      maxSteps: 10,
+      maxTokens: MAX_TOKENS,
+      onStepFinish: async ({ text, toolCalls, toolResults }) => {
+        if (text?.trim()) await onProgress(text.trim())
+        if (toolCalls?.length) {
+          const names = toolCalls.map((tc: any) => tc.toolName.replace(/_/g, ' ')).join(', ')
+          await onProgress(`⚡ Executing: ${names}…`)
+        }
+      },
     })
 
-    // Collect text output from this round
-    const textBlocks = response.content.filter((b: any) => b.type === 'text').map((b: any) => b.text)
-    if (textBlocks.length > 0 && textBlocks.join('').trim()) {
-      await onProgress(textBlocks.join('\n').trim())
+    return result.text || result.steps?.map((s: any) => s.text).filter(Boolean).join('\n') || 'Task completed.'
+  } catch (err: any) {
+    // Surface a clean error rather than the raw 401 JSON
+    const msg = err?.message || String(err)
+    if (msg.includes('401') || msg.includes('User not found')) {
+      return `Could not connect to the AI provider. Please check OPENROUTER_API_KEY in your .env.local file is valid and has credits.`
     }
-
-    // If done — no tool calls — return final output
-    if (response.stop_reason === 'end_turn' || response.stop_reason === 'max_tokens') {
-      const finalText = response.content
-        .filter((b: any) => b.type === 'text')
-        .map((b: any) => b.text).join('\n').trim()
-      if (allToolResults.length > 0) {
-        return finalText + '\n\n**Actions completed:**\n' + allToolResults.join('\n')
-      }
-      return finalText
-    }
-
-    // Extract tool use blocks
-    const toolUseBlocks = response.content.filter((b: any) => b.type === 'tool_use')
-    if (toolUseBlocks.length === 0) break
-
-    // Add assistant message with tool calls to history
-    messages.push({ role: 'assistant', content: response.content })
-
-    // Execute tools
-    const calls: ToolCall[] = toolUseBlocks.map((b: any) => ({
-      id: b.id, name: b.name, input: b.input
-    }))
-
-    const toolNames = calls.map(c => c.name.replace(/_/g, ' ')).join(', ')
-    await onProgress(`⚡ Executing: ${toolNames}…`)
-
-    const results = await executeTools(calls, workspaceId)
-    allToolResults.push(...results.map(r => r.content))
-
-    // Add tool results back to history
-    messages.push({
-      role: 'user',
-      content: results.map(r => ({
-        type: 'tool_result',
-        tool_use_id: r.toolUseId,
-        content: r.content,
-        is_error: r.isError,
-      }))
-    })
+    throw err
   }
-
-  // Exhausted rounds — synthesize from what we have
-  const finalMessages = [...messages, {
-    role: 'user',
-    content: 'Summarize what was accomplished based on the tool results above.'
-  }]
-  const summary = await client.messages.create({
-    model: EXECUTOR_MODEL, max_tokens: 1000,
-    system: systemPrompt, messages: finalMessages,
-  })
-  const summaryText = summary.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n').trim()
-
-  return allToolResults.length > 0
-    ? summaryText + '\n\n**Actions completed:**\n' + allToolResults.join('\n')
-    : summaryText
 }
 
 // ─── Run a single pet step ────────────────────────────────────────────────────
@@ -235,7 +225,6 @@ async function runPet(petName: PetName, task: Task, previousOutputs: string[], s
 
   let output: string
 
-  // Bolt uses the full agentic tool loop; other agents use simple text generation
   if (pet.agentType === 'executor') {
     output = await runAgenticLoop(
       systemPrompt,
@@ -246,19 +235,31 @@ async function runPet(petName: PetName, task: Task, previousOutputs: string[], s
       }
     )
   } else {
-    const client = useAnthropic()
-    const response = await client.messages.create({
-      model: AGENT_MODEL,
-      max_tokens: MAX_TOKENS,
+    // Stream token by token, emit progress every ~120 chars
+    let accumulated = ''
+    let lastEmitLen = 0
+    const EMIT_EVERY = 120
+
+    const { textStream } = streamText({
+      model: getLLM(AGENT_MODEL),
       system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }],
+      prompt: userMessage,
+      maxTokens: MAX_TOKENS,
     })
-    output = response.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n').trim()
-    await postProgress(task.id, task.workspace_id, pet.displayName, pet.agentType, 'progress', output)
+
+    for await (const delta of textStream) {
+      accumulated += delta
+      if (accumulated.length - lastEmitLen >= EMIT_EVERY) {
+        lastEmitLen = accumulated.length
+        await postProgress(task.id, task.workspace_id, pet.displayName, pet.agentType, 'progress', accumulated)
+      }
+    }
+    output = accumulated
+    // Final progress emit with complete text
+    if (output) await postProgress(task.id, task.workspace_id, pet.displayName, pet.agentType, 'progress', output)
   }
 
   await sb.from('task_pipeline').update({ status: 'completed', output, completed_at: new Date().toISOString() }).eq('id', stepId)
-
   saveMemory(task.workspace_id, pet.agentType, output, task.id).catch(() => {})
   return output
 }
@@ -269,7 +270,6 @@ export async function runPipeline(task: Task): Promise<string> {
   const sb = supabaseAdmin()
   const pipeline = getPipelineForTask(task.assigned_agent || 'default')
 
-  // Create pipeline step records
   const stepRecords: { petName: PetName; stepId: string }[] = []
   for (let i = 0; i < pipeline.length; i++) {
     const pet = PETS[pipeline[i]]
@@ -291,11 +291,9 @@ export async function runPipeline(task: Task): Promise<string> {
       const errMsg = err.message || String(err)
       await sb.from('task_pipeline').update({ status: 'failed', completed_at: new Date().toISOString() }).eq('id', stepId)
       await postProgress(task.id, task.workspace_id, PETS[petName].displayName, PETS[petName].agentType, 'error', `${PETS[petName].displayName} failed: ${errMsg}`)
-      // Push placeholder so subsequent steps still have something to work with
       outputs.push(`[${petName} failed: ${errMsg}]`)
     }
   }
 
-  // Return last non-error output
   return [...outputs].reverse().find(o => !o.startsWith('[')) || outputs[outputs.length - 1] || ''
 }

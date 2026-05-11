@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams } from 'next/navigation'
+import { swr, cacheInvalidate } from '@/lib/tab-cache'
 
 interface WorkspaceFile {
   id: string; filename: string; size_bytes: number; mime_type: string
@@ -48,16 +49,14 @@ function MemoryFilesPreview({ workspaceId }: { workspaceId: string }) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    fetch(`/api/memory?workspaceId=${workspaceId}`, { credentials: 'include' })
-      .then(async r => {
-        if (!r.ok) {
-          console.warn('[Memory] API error', r.status, await r.text().catch(() => ''))
-          return { files: [] }
-        }
-        return r.json()
-      })
-      .then(data => { setFiles(data?.files ?? []); setLoading(false) })
-      .catch(err => { console.warn('[Memory] fetch failed', err); setLoading(false) })
+    swr(
+      `files:memory:${workspaceId}`,
+      () => fetch(`/api/memory?workspaceId=${workspaceId}`, { credentials: 'include' })
+        .then(r => r.ok ? r.json() : { files: [] })
+        .then(d => d?.files ?? []),
+      setFiles,
+      setLoading,
+    )
   }, [workspaceId])
 
   if (loading) return <div style={{ fontSize:12, color:'var(--text-3)', padding:'8px 0' }}>Loading memory…</div>
@@ -105,12 +104,14 @@ export default function FilesPage() {
   const totalChunks = files.reduce((sum, f) => sum + (f.embedding_meta?.chunks || 0), 0)
   const totalBytes = files.reduce((sum, f) => sum + (f.size_bytes || 0), 0)
 
-  async function loadFiles() {
-    setLoading(true)
-    try {
-      const res = await fetch(`/api/files?workspace_id=${workspaceId}`)
-      setFiles(await res.json() || [])
-    } finally { setLoading(false) }
+  async function loadFiles(invalidate = false) {
+    if (invalidate) cacheInvalidate(`files:kb:${workspaceId}`)
+    await swr(
+      `files:kb:${workspaceId}`,
+      () => fetch(`/api/files?workspace_id=${workspaceId}`).then(r => r.json()).then(d => d || []),
+      setFiles,
+      setLoading,
+    )
   }
 
   useEffect(() => { loadFiles() }, [workspaceId])
@@ -129,7 +130,7 @@ export default function FilesPage() {
       catch (err: any) { alert(`Failed: ${err.message}`) }
     }
     setUploadProgress(100); setUploadStatus('Done!')
-    await loadFiles()
+    await loadFiles(true)
     setTimeout(() => setUploading(false), 1200)
   }
 
